@@ -1,5 +1,7 @@
 # Mem0α
 
+English | [日本語](README.ja.md)
+
 Provider-agnostic **long-term memory for LLM agents** — a thin, opinionated
 layer over [`mem0`](https://github.com/mem0ai/mem0) that adds the retrieval-
 and ingestion-quality machinery a conversational agent actually needs, plus a

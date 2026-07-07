@@ -1,5 +1,7 @@
 # Architecture
 
+English | [日本語](ARCHITECTURE.ja.md)
+
 `llm_mem0` is a thin, opinionated layer over [`mem0`](https://github.com/mem0ai/mem0).
 `mem0` already handles the hard vector-store plumbing (embedding, upsert,
 similarity search) and is multi-provider. This library adds the retrieval-
