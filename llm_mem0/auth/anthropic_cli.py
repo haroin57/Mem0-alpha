@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -43,16 +44,16 @@ REFRESH_SCOPES = [
 # Refresh 5 minutes before expiry.
 EXPIRY_BUFFER_MS = 5 * 60 * 1000
 
-# Any process that shares the ~/.claude directory with us could otherwise
-# race our atomic-rename (TOCTOU) or read a refreshed token off disk. Refuse
-# to write credentials back unless the directory AND the existing file are
-# already restricted to the current user.
-_CREDS_DIR_MODE_MASK = 0o077  # group/other must have no bits set
-_CREDS_FILE_MODE_MASK = 0o077
+# We write a refreshed token back only into a path we own. The *file* must
+# additionally not be group/other-readable (it holds the token). The directory
+# is only required to be owned by us — ``~/.claude`` is created 0o755 by the
+# CLI on a normal setup, and demanding 0o700 there would make token persistence
+# fail on virtually every machine (which in turn orphans the CLI's own token).
+_CREDS_FILE_MODE_MASK = 0o077  # group/other must have no bits set on the file
 
 
 def _verify_path_privacy(path: str, *, is_dir: bool) -> bool:
-    """Return True iff `path` is owned by us and g/o perms are clear."""
+    """Return True iff we own `path` (and, for a file, g/o perms are clear)."""
     try:
         st = os.lstat(path)
     except FileNotFoundError:
@@ -66,14 +67,14 @@ def _verify_path_privacy(path: str, *, is_dir: bool) -> bool:
             path, st.st_uid, os.getuid(),
         )
         return False
-    mode = stat.S_IMODE(st.st_mode)
-    mask = _CREDS_DIR_MODE_MASK if is_dir else _CREDS_FILE_MODE_MASK
-    if mode & mask:
-        log.error(
-            "Refusing to touch %s: mode=%#o grants g/o access (mask %#o)",
-            path, mode, mask,
-        )
-        return False
+    if not is_dir:
+        mode = stat.S_IMODE(st.st_mode)
+        if mode & _CREDS_FILE_MODE_MASK:
+            log.error(
+                "Refusing to touch %s: mode=%#o grants g/o access (mask %#o)",
+                path, mode, _CREDS_FILE_MODE_MASK,
+            )
+            return False
     return True
 
 
@@ -102,6 +103,15 @@ def _oauth_headers(extra: dict | None = None) -> dict:
 # the file. Set LLM_MEM0_DISABLE_KEYCHAIN=1 to force the file path.
 _KEYCHAIN_SERVICE = os.environ.get("CLAUDE_CLI_KEYCHAIN_SERVICE", "Claude Code-credentials")
 
+# A direct token refresh ROTATES the refresh token, which invalidates the copy
+# the Claude Code CLI holds unless we can write the new one back to the same
+# store. We can do that for the file store; we cannot reliably do it for the
+# macOS Keychain. So when the token came from the Keychain we do NOT refresh by
+# default — we rely on the CLI's own refresh cycle (re-reading the store) and
+# only refresh directly if the user opts in, accepting they may need to
+# `claude` re-login afterward.
+_ALLOW_KEYCHAIN_REFRESH = os.environ.get("LLM_MEM0_ALLOW_TOKEN_REFRESH", "0") == "1"
+
 
 def _read_credentials_from_keychain() -> dict | None:
     """On macOS, read the Claude Code OAuth blob from the login Keychain.
@@ -127,12 +137,9 @@ def _read_credentials_from_keychain() -> dict | None:
         return None
 
 
-def _read_credentials(path: str | None = None) -> dict | None:
+def _read_credentials_from_file(path: str | None = None) -> dict | None:
     if path is None:
         path = CREDENTIALS_PATH
-    kc = _read_credentials_from_keychain()
-    if kc and kc.get("accessToken"):
-        return kc
     try:
         with open(path) as f:
             data = json.load(f)
@@ -255,6 +262,7 @@ class AnthropicCliAuth(AuthBackend):
         self._access_token: str | None = None
         self._refresh_token: str | None = None
         self._expires_at: int = 0
+        self._source: str = "file"  # "file" | "keychain" — where we read the token
         self._http_session: aiohttp.ClientSession | None = None
         self._client = None
         self._client_token: str | None = None
@@ -267,7 +275,14 @@ class AnthropicCliAuth(AuthBackend):
         _patch_anthropic_sdk()
 
     def _load_from_disk(self) -> bool:
-        creds = _read_credentials(CREDENTIALS_PATH)
+        # Prefer the Keychain (macOS) and record which store the token came
+        # from — it decides whether we may safely refresh (a rotating refresh
+        # is only safe when we can write the new token back to the same store).
+        kc = _read_credentials_from_keychain()
+        if kc and kc.get("accessToken"):
+            creds, self._source = kc, "keychain"
+        else:
+            creds, self._source = _read_credentials_from_file(CREDENTIALS_PATH), "file"
         if not creds or not creds.get("accessToken"):
             return False
         self._access_token = creds.get("accessToken")
@@ -323,17 +338,29 @@ class AnthropicCliAuth(AuthBackend):
         # token without us rotating anything.
         if self._load_from_disk() and not self._is_expired():
             return self._access_token
-        # Still expired: refresh ourselves as a last resort. This ROTATES the
-        # refresh token, which invalidates the copy the Claude Code CLI holds —
-        # the user may then need to `claude` re-login. We only reach here when
-        # the CLI has not refreshed the token for us.
+        # Still expired. Refreshing ourselves rotates the refresh token; that's
+        # only safe when we can persist the new one back to the same store the
+        # CLI reads. We can for the file store, but not reliably for the macOS
+        # Keychain — so a Keychain-sourced token is refreshed only on explicit
+        # opt-in. Otherwise we leave the CLI's token untouched and return what
+        # we have (callers treat an unusable token as "no memory this turn").
         if self._is_expired() and self._refresh_token:
-            log.warning(
-                "Claude Code CLI token expired and the CLI has not refreshed it; "
-                "refreshing directly (this may require a CLI re-login afterward)."
-            )
-            if await self._refresh():
-                return self._access_token
+            if self._source == "keychain" and not _ALLOW_KEYCHAIN_REFRESH:
+                log.warning(
+                    "Claude Code CLI token (from Keychain) is expired and the CLI "
+                    "hasn't refreshed it. Not refreshing directly, to avoid "
+                    "invalidating the CLI's login. Run any `claude` command to "
+                    "refresh it, or set LLM_MEM0_ALLOW_TOKEN_REFRESH=1 to override."
+                )
+            else:
+                log.warning(
+                    "Claude Code CLI token expired and the CLI has not refreshed "
+                    "it; refreshing directly%s.",
+                    " (Keychain source — this may require a CLI re-login afterward)"
+                    if self._source == "keychain" else "",
+                )
+                if await self._refresh():
+                    return self._access_token
         return self._access_token
 
     async def _get_client(self):

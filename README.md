@@ -58,9 +58,20 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design.
    from `~/.claude/.credentials.json`; on **macOS** the CLI stores it in the
    login **Keychain**, so the library reads it from there (falling back to the
    file). This reuses *your own* authenticated session — it does not spoof the
-   CLI's network fingerprint. When a token is expired the library re-reads the
-   CLI's own store first and only refreshes directly as a last resort (a direct
-   refresh rotates the token and can force a `claude` re-login).
+   CLI's network fingerprint.
+
+   **Token freshness is handled conservatively so the library never breaks your
+   CLI login.** When the token is expired it first re-reads the CLI's own store
+   (the CLI keeps it fresh through normal use). If it's still expired, behavior
+   depends on the source: a **file**-sourced token is refreshed directly and
+   written back to the same file the CLI reads (they stay in sync); a
+   **Keychain**-sourced token is *not* refreshed by default, because a refresh
+   rotates the token and we can't reliably write the new one back to the
+   Keychain — doing so would invalidate the CLI's own login. In that case the
+   library logs a message telling you to run any `claude` command (which
+   refreshes the token) and returns no memory for that call. Set
+   `LLM_MEM0_ALLOW_TOKEN_REFRESH=1` to opt into direct Keychain refresh anyway
+   (accepting a possible `claude` re-login).
 2. **Standard API key** — otherwise it falls back to an API key from the
    environment, which works with any provider `mem0` supports.
 

@@ -116,7 +116,7 @@ def format_memories_for_prompt(memories: list[dict]) -> str:
         text = m.get("memory", m.get("text", ""))
         if text:
             lines.append(f"- {_scrub_fact_text(text)}{_fact_meta_suffix(m)}")
-    lines.append("[End of Mem0 memories]")
+    lines.append("[End of Long-term memory]")
     return "\n".join(lines)
 
 
