@@ -2,62 +2,62 @@
 
 [English](ARCHITECTURE.md) | 日本語
 
-`llm_mem0` は [`mem0`](https://github.com/mem0ai/mem0) の薄い、意見の強い（opinionated）ラッパーです。`mem0` はベクトルストアまわりの難しい部分（埋め込み、upsert、類似検索）を既に引き受けており、マルチプロバイダ対応です。このライブラリは、その素のベクトルストアの上に、会話エージェントが必要とする検索・取り込み品質の仕組みを足し、さらに「LLM の CLI にログイン済みなら別途 API キーを用意しなくていい」着脱式の認証層を追加します。
+`llm_mem0` は [`mem0`](https://github.com/mem0ai/mem0) の上に薄く乗せた層です。`mem0` はベクトルストア周りの厄介な部分（埋め込み、upsert、類似検索）をすでに引き受けていて、複数プロバイダにも対応しています。Mem0α はその素のベクトルストアの上に、会話エージェントで必要になる検索・保存の作り込みを足し、さらに「LLM の CLI にログイン済みなら API キーを別途用意しなくていい」差し替え可能な認証層を加えたものです。
 
-## なぜ mem0 を直接使わないのか
+## `mem0` をそのまま使わない理由
 
-`mem0` の組み込み抽出器は、簡潔な英語の `Prefers ~` 形式の文を生成し、1ターンにユーザー発話とアシスタント発話の両方が含まれると話者が混ざります。長期運用の個人エージェントでは、これが3つの問題を生みました。本ライブラリはそれを解消します。
+`mem0` の組み込み抽出は、`Prefers ~` のような素っ気ない英文を返し、1ターンにユーザーとアシスタント双方の発言が入ると話者が混ざります。長く使う個人向けエージェントでは、これが次の3つの問題になりました。Mem0α はそれぞれに対処しています。
 
-1. **話者混入（Speaker bleed）** — アシスタントや他者に関する事実がユーザーの記憶に漏れ込む。ここでは抽出を *自己帰属可能な*（`speaker == "self"`）事実に限定し、保存前に検証します。
-2. **dedup 肥大** — 抽出器が毎ターン同じ事実を言い換えるため、ニアデュープが積み上がる。ここでは2段階 dedup（cosine 事前フィルタ → LLM マージ判定）で畳み込み、属性レジストリが単一値属性（体重・居住地…）を決定的に上書きします。
-3. **想起ミス** — 純粋なベクトル検索では、無関係な近傍に埋め込まれた固有名詞（人名・曲名）を取りこぼす。ここでは検索をハイブリッド化し、ベクトル検索と BM25 キーワードインデックスを Reciprocal Rank Fusion で融合、必要に応じて query rewrite + HyDE で拡張し rerank します。
+1. **話者の混入** — アシスタントや他人の事実が、ユーザーの記憶に紛れ込む。ここでは抽出を「本人に帰属できる事実」（`speaker == "self"`）に限定し、保存前に検証します。
+2. **重複の肥大** — 抽出が毎ターン同じ事実を言い換えるので、ほぼ同じ記憶が積み上がる。ここでは2段階の重複排除（cosine で候補を絞り、LLM でマージ判定）でまとめ、属性レジストリが単一値の属性（体重、住所など）を古い値ごと置き換えます。
+3. **想起の取りこぼし** — 純粋なベクトル検索だと、無関係な近傍に埋め込まれた固有名詞（人名、曲名）を拾えない。ここでは検索をハイブリッドにし、ベクトル検索と BM25 のキーワード検索を Reciprocal Rank Fusion で束ね、必要に応じてクエリ書き換えと HyDE で広げてから並べ替えます。
 
 ## モジュール構成
 
-| モジュール | 責務 |
+| モジュール | 役割 |
 |---|---|
-| `auth/` | 着脱式の認証バックエンド（下記参照）。 |
-| `client.py` | `mem0.Memory` のシングルトン + 設定ビルダ。低レベルの `get_all_memories` / `delete_memory`。 |
-| `settings.py` | 環境変数ベースの設定デフォルトを一箇所に集約。 |
-| `ingest.py` | `add_memories` — 取り込みの入口（抽出ゲート、hash dedup、ニアデュープマージ、graph/BM25/fact-store インデックス化）。 |
-| `extract.py` | 小型モデルによる、会話ターンからの自己事実 + エンティティ関係の抽出。taxonomy/importance/tier 分類。 |
-| `dedup.py` | 2段階 dedup: cosine 候補ゲート + LLM マージ/衝突判定。 |
-| `conflict.py` | 新しい事実が既存を「更新/矛盾/共存」のどれに当たるか分類する。 |
-| `attribute_registry.py` | 単一値属性の統制語彙。新しい値が古い値を決定的に archive する。 |
-| `reinforce.py` | 繰り返し出る事実の read-modify-write 強化（言及回数、最終確認）。 |
-| `search.py` | `search_memories` / `search_memories_multi` / `search_memories_smart` — ハイブリッド検索、query rewrite、HyDE、rerank、graph 展開。 |
-| `graph.py` | SQLite のエンティティ/関係グラフ（エイリアス、共起、1-hop 展開）。 |
-| `bm25_index.py` | 事実に対する SQLite FTS5 キーワードインデックス（CJK は `morpho` で事前トークナイズ）。 |
-| `history_index.py` / `history_embed.py` | 会話全履歴のキーワード/埋め込みインデックス。整理済みの fact store とは別枠。 |
-| `morpho.py` | FTS インデックス用の日本語形態素トークナイズ（任意）。トークナイザ未導入時は優雅にフォールバック。 |
-| `fact_store.py` | 属性値変化のイベントソーシング SQLite ログ（任意）。 |
-| `format.py` | 取り出した記憶/履歴ヒットをプロンプトブロックに整形する。 |
-| `sanitize.py` | 未信頼テキストのプロンプトインジェクション対策（sentinel / power-phrase のサニタイズ）。 |
-| `batch.py` | 会話ごとのターン蓄積器（バッチ取り込み用）。 |
+| `auth/` | 差し替え可能な認証バックエンド（下で詳述） |
+| `client.py` | `mem0.Memory` のシングルトンと設定ビルダ。低レベルの `get_all_memories` / `delete_memory` |
+| `settings.py` | 環境変数ベースの設定の既定値を一箇所にまとめたもの |
+| `ingest.py` | `add_memories` — 取り込みの入口（抽出ゲート、ハッシュによる重複排除、近似重複のマージ、graph / BM25 / fact-store へのインデックス化） |
+| `extract.py` | 小型モデルで、会話ターンから本人の事実とエンティティ間の関係を抽出。分類（カテゴリ・重要度・鮮度）も行う |
+| `dedup.py` | 2段階の重複排除。cosine で候補を絞り、LLM でマージ・衝突を判定する |
+| `conflict.py` | 新しい事実が既存の事実を「更新するのか、矛盾するのか、両立するのか」を分類する |
+| `attribute_registry.py` | 単一値の属性のための統制語彙。新しい値が古い値をきちんと退避させる |
+| `reinforce.py` | 繰り返し現れる事実の強化（言及回数や最終確認日時の読み書き更新） |
+| `search.py` | `search_memories` / `search_memories_multi` / `search_memories_smart` — ハイブリッド検索、クエリ書き換え、HyDE、並べ替え、グラフ展開 |
+| `graph.py` | SQLite のエンティティ／関係グラフ（別名、共起、1ホップ展開） |
+| `bm25_index.py` | 事実に対する SQLite FTS5 のキーワードインデックス（CJK は `morpho` で事前にトークナイズ） |
+| `history_index.py` / `history_embed.py` | 会話の全履歴を対象にしたキーワード／埋め込みインデックス。整理済みの fact store とは別枠 |
+| `morpho.py` | FTS 用の日本語形態素トークナイズ（任意）。トークナイザが入っていなければそのままフォールバックする |
+| `fact_store.py` | 属性値の変化をイベントとして記録する SQLite ログ（任意） |
+| `format.py` | 取り出した記憶や履歴を、プロンプトに差し込む断片へ整形する |
+| `sanitize.py` | 信頼できないテキストに対するインジェクション対策（骨組み偽装や権限奪取フレーズの除去） |
+| `batch.py` | 会話ごとにターンを溜めておく蓄積器（バッチ取り込み用） |
 
 ## 認証層
 
-このライブラリで唯一、本当に新規性のある部分です。LLM の呼び出しは2箇所で発生し、認証バックエンドは単一の資格情報からその両方を賄います。
+このライブラリで唯一、本当に新しいと言える部分です。LLM の呼び出しは2箇所で起き、認証バックエンドはひとつの資格情報からその両方をまかないます。
 
-1. **mem0 自身の内部呼び出し**（`Memory.add()` / `search()` 内での抽出器/埋め込み器）— バックエンドが `mem0_llm_config()` を提供し、`Memory.from_config()` が消費する `{"provider", "config"}` ブロックを返します。
-2. **本ライブラリ自身の直接ヘルパー呼び出し**（自己事実抽出、メタデータ分類、dedup 判定、query rewrite/rerank）— バックエンドが `complete(system, user_message, model, max_tokens) -> str` を提供します。プロバイダ非依存の単発補完で、失敗時は `""` を返すため、呼び出し側が SDK ごとに特別扱いする必要がありません。
+1. **`mem0` 自身の内部呼び出し**（`Memory.add()` や `search()` の中で走る抽出・埋め込み）— バックエンドが `mem0_llm_config()` を返し、`Memory.from_config()` が読む `{"provider", "config"}` のブロックを供給します。
+2. **このライブラリ自身のヘルパー呼び出し**（本人の事実抽出、メタデータ分類、重複判定、クエリ書き換えや並べ替え）— バックエンドが `complete(system, user_message, model, max_tokens) -> str` を供給します。プロバイダに依存しない単発の補完で、失敗時は `""` を返すので、呼び出し側が SDK ごとの差を気にせずに済みます。
 
-### バックエンド（この順で自動検出）
+### バックエンド（この順で自動判定）
 
-- **`AnthropicCliAuth`** — 既存の **Claude Code CLI** の OAuth セッションを流用します。資格情報のソースはプラットフォーム依存で、Linux では `~/.claude/.credentials.json`（`claude` CLI が読み書き・refresh する同じファイル）を読み、macOS では CLI がログイン **Keychain** に保存しているので `security find-generic-password` 経由で読み取ります（ファイルへフォールバック）。必須の `anthropic-beta: oauth-2025-04-20` ヘッダを付与し（これが無い OAuth トークンは 401 で弾かれます）、`anthropic.Anthropic.__init__` にモンキーパッチを当てて、mem0 が内部生成するクライアントが `x-api-key` ではなく Bearer 認証を使うようにします。パッチはスレッドセーフな double-checked locking で保護されています。**これはあなた自身の認証済みセッションの流用であり、CLI のネットワーク指紋を偽装しません** — リクエストは素の Anthropic SDK 経由で出ます。
+- **`AnthropicCliAuth`** — 既存の **Claude Code CLI** の OAuth セッションを流用します。資格情報の場所は OS で異なり、Linux では `~/.claude/.credentials.json`（`claude` が読み書き・更新するのと同じファイル）を、macOS では CLI がログイン **Keychain** に置いているので `security find-generic-password` 経由で読みます（読めなければファイルにフォールバック）。必須の `anthropic-beta: oauth-2025-04-20` ヘッダを付け（これが無い OAuth トークンは 401 で弾かれます）、`anthropic.Anthropic.__init__` にパッチを当てて、`mem0` が内部で作るクライアントが `x-api-key` ではなく Bearer 認証を使うようにします。パッチはスレッドセーフな二重チェックロックで守っています。**あくまであなた自身のログインの流用**であって、CLI のネットワーク指紋を偽装するものではありません。リクエストは素の Anthropic SDK 経由で飛びます。
 
-  **トークンの鮮度 / CLI との共存。** キャッシュしたトークンが失効している場合、バックエンドはまず CLI 自身のストア（Keychain/ファイル）を *再読み込み* します。CLI が稼働していればトークンを新鮮に保っているので、こちらは何もローテーションせずその refresh サイクルに便乗できます。それでも失効している場合にのみ直接 refresh しますが、その際は警告をログに出します。直接 refresh は refresh token をローテーションし、CLI が保持するコピーを無効化して `claude` の再ログインを強いる可能性があるためです。この順序により、ライブラリがユーザーの CLI ログインを黙って壊すことを防いでいます。
-- **`ApiKeyAuth`** — 環境変数の標準 API キー（`ANTHROPIC_API_KEY`、`OPENAI_API_KEY`、…）。これが、mem0 が内部呼び出しで対応する任意のプロバイダで本ライブラリを動かせる経路です。`complete()` は Anthropic と OpenAI についてネイティブ実装されています。
+  **トークンの鮮度と、CLI との共存。** キャッシュしたトークンが切れていたら、バックエンドはまず CLI 自身の保存先（Keychain／ファイル）を読み直します。CLI が動いていればトークンを新しく保っているので、こちらは何もローテーションせずに相乗りできます。それでも切れているときだけ直接更新しますが、その際は警告をログに残します。直接更新は refresh トークンをローテーションし、CLI が持っているコピーを無効にして `claude` の再ログインを強いかねないためです。この順序のおかげで、ライブラリが黙ってユーザーの CLI ログインを壊すことがありません。
+- **`ApiKeyAuth`** — 環境変数の標準 API キー（`ANTHROPIC_API_KEY`、`OPENAI_API_KEY` など）。内部呼び出しについては、`mem0` が対応するどのプロバイダでもこの経路で動きます。`complete()` は Anthropic と OpenAI についてネイティブに実装済みです。
 
-選択ロジックは `auth/__init__.py:get_auth_backend()`（プロセス全体でキャッシュされるシングルトン）にあります。プロバイダを追加するには `AuthBackend`（`auth/base.py`）を実装し、そこに登録します。
+どのバックエンドを使うかは `auth/__init__.py:get_auth_backend()`（プロセス全体でキャッシュするシングルトン）で決めます。プロバイダを増やすには `AuthBackend`（`auth/base.py`）を実装し、そこに登録します。
 
-> **スコープ注記。** Codex CLI のローカル認証キャッシュ（`~/.codex/auth.json`）は **意図的に流用していません**。OpenAI が公式に「内部実装の詳細でありサードパーティによる読み取り経路はサポートしない」と明記しており、スキーマも非公開のためです。OpenAI/Codex のモデルは標準の `OPENAI_API_KEY` 経由で使ってください。
+> **補足。** Codex CLI のローカル認証キャッシュ（`~/.codex/auth.json`）は、あえて使いません。OpenAI がこれを「内部実装であり、外部ツールからの読み取り経路はサポートしない」と明言していて、スキーマも公開されていないためです。OpenAI／Codex のモデルは標準の `OPENAI_API_KEY` 経由で使ってください。
 
 ## ストレージ
 
-- **ベクトル**: ChromaDB。HTTP サーバー（`CHROMA_MODE=server`、デフォルト。embedded な HNSW インデックスを破損させうる複数プロセス書き込みレースを避けられる）か、embedded なオンディスクストア（`CHROMA_MODE=embedded`）。
-- **それ以外すべて**（エンティティグラフ、BM25 インデックス、履歴インデックス、fact store）: `LLM_MEM0_STATE_DIR`（デフォルト `~/.llm_mem0/state`）配下の SQLite ファイル。各インデックスを独立して再構築・破棄できるよう、それぞれ別ファイルにしています。
+- **ベクトル**: ChromaDB。既定は HTTP サーバー（`CHROMA_MODE=server`。複数プロセスで書き込みが競合して embedded な HNSW インデックスが壊れるのを避けられる）で、`CHROMA_MODE=embedded` にすればオンディスクに持てます。
+- **それ以外すべて**（エンティティグラフ、BM25 インデックス、履歴インデックス、fact store）: `LLM_MEM0_STATE_DIR`（既定 `~/.llm_mem0/state`）の下の SQLite ファイル。各インデックスを個別に作り直したり消したりできるよう、それぞれ別ファイルにしています。
 
 ## 設定
 
-すべてのつまみは安全なデフォルト付きの環境変数で、`settings.py` に集約されています。主なもの: `CHROMA_MODE` / `CHROMA_HOST` / `CHROMA_PORT`、`MEM0_COLLECTION_NAME`、`MEM0_LLM_PROVIDER` / `MEM0_LLM_MODEL`、`MEM0_EMBEDDER_PROVIDER` / `MEM0_EMBEDDER_MODEL`、および検索の機能フラグ（`MEM0_HYBRID_ENABLED`、`MEM0_HYDE_ENABLED`、`MEM0_SCOPE_FILTER_ENABLED`、…）。
+つまみはすべて環境変数で、安全な既定値が入っていて、`settings.py` にまとまっています。主なものは、`CHROMA_MODE` / `CHROMA_HOST` / `CHROMA_PORT`、`MEM0_COLLECTION_NAME`、`MEM0_LLM_PROVIDER` / `MEM0_LLM_MODEL`、`MEM0_EMBEDDER_PROVIDER` / `MEM0_EMBEDDER_MODEL`、そして検索の機能フラグ（`MEM0_HYBRID_ENABLED`、`MEM0_HYDE_ENABLED`、`MEM0_SCOPE_FILTER_ENABLED` など）です。
