@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-mem0"
+version = "0.1.0"
+description = "Provider-agnostic long-term memory for LLM agents — reuses your Claude Code CLI session or any API key"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "llm-mem0 contributors" }]
+keywords = ["llm", "memory", "mem0", "rag", "agents", "anthropic", "openai", "chromadb"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "mem0ai>=0.1.0",
+    "chromadb>=0.5",
+    "aiohttp>=3.9",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.30"]
+# Japanese morphological tokenization for the BM25 index (optional; the index
+# falls back gracefully when absent).
+japanese = ["janome>=0.5"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.urls]
+Homepage = "https://github.com/haroin/llm-mem0"
+Repository = "https://github.com/haroin/llm-mem0"
+
+[tool.setuptools.packages.find]
+include = ["llm_mem0*"]
+
+[tool.setuptools.package-data]
+llm_mem0 = ["py.typed"]

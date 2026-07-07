@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.so
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Local state — memory databases, sqlite indices, embedded Chroma.
+# NEVER commit real memory data.
+.llm_mem0/
+.state/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+chroma/
+mem0_db/
+
+# Credentials — NEVER commit tokens or keys.
+.env
+.env.*
+*.credentials.json
+.credentials.json
+auth.json
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+.omc/
+.claude/
