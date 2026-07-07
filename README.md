@@ -59,7 +59,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design.
    command already keeps, so **no separate `ANTHROPIC_API_KEY` is needed**. It
    reads the token, adds the required `anthropic-beta: oauth-2025-04-20` header,
    and patches the Anthropic SDK to use Bearer auth. Where the token lives
-   depends on the OS: **Linux** keeps it in `~/.claude/.credentials.json`, while
+   depends on the OS: **Linux and Windows** keep it in
+   `~/.claude/.credentials.json` (or under `$CLAUDE_CONFIG_DIR`), while
    **macOS** stores it in the login **Keychain**, so the library reads it from
    there (falling back to the file). This just reuses *your own* login; it does
    not spoof the CLI's network fingerprint.

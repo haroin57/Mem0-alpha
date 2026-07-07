@@ -69,10 +69,13 @@ backend serves both from a single set of credentials:
 ### Backends (auto-detected, in order)
 
 - **`AnthropicCliAuth`** reuses an existing **Claude Code CLI** OAuth session.
-  Where the credentials live depends on the OS: on Linux it reads
-  `~/.claude/.credentials.json` (the same file `claude` reads and refreshes),
-  and on macOS the CLI keeps them in the login **Keychain**, so the backend
-  reads them via `security find-generic-password`, falling back to the file. It
+  Where the credentials live depends on the OS: on Linux and Windows it reads
+  `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`) — the same file
+  `claude` reads and refreshes — and on macOS the CLI keeps them in the login
+  **Keychain**, so the backend reads them via `security find-generic-password`,
+  falling back to the file. The POSIX permission hardening (owner + 0o600
+  checks) is skipped on Windows, where the file inherits the user profile's
+  ACLs instead. It
   adds the required `anthropic-beta: oauth-2025-04-20` header (an OAuth token is
   rejected 401 without it) and patches `anthropic.Anthropic.__init__` so the
   client mem0 builds internally uses Bearer auth instead of `x-api-key` —

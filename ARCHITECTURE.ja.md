@@ -44,7 +44,7 @@
 
 ### バックエンド（この順で自動判定）
 
-- **`AnthropicCliAuth`** — 既存の **Claude Code CLI** の OAuth セッションを流用します。資格情報の場所は OS で異なり、Linux では `~/.claude/.credentials.json`（`claude` が読み書き・更新するのと同じファイル）を、macOS では CLI がログイン **Keychain** に置いているので `security find-generic-password` 経由で読みます（読めなければファイルにフォールバック）。必須の `anthropic-beta: oauth-2025-04-20` ヘッダを付け（これが無い OAuth トークンは 401 で弾かれます）、`anthropic.Anthropic.__init__` にパッチを当てて、`mem0` が内部で作るクライアントが `x-api-key` ではなく Bearer 認証を使うようにします。パッチはスレッドセーフな二重チェックロックで守っています。**あくまであなた自身のログインの流用**であって、CLI のネットワーク指紋を偽装するものではありません。リクエストは素の Anthropic SDK 経由で飛びます。
+- **`AnthropicCliAuth`** — 既存の **Claude Code CLI** の OAuth セッションを流用します。資格情報の場所は OS で異なり、Linux と Windows では `~/.claude/.credentials.json`（`$CLAUDE_CONFIG_DIR` があればその配下。`claude` が読み書き・更新するのと同じファイル）を、macOS では CLI がログイン **Keychain** に置いているので `security find-generic-password` 経由で読みます（読めなければファイルにフォールバック）。なお POSIX の権限ハードニング（所有者・0o600 チェック）は Windows ではスキップし、代わりにユーザープロファイルの ACL 継承に任せます。必須の `anthropic-beta: oauth-2025-04-20` ヘッダを付け（これが無い OAuth トークンは 401 で弾かれます）、`anthropic.Anthropic.__init__` にパッチを当てて、`mem0` が内部で作るクライアントが `x-api-key` ではなく Bearer 認証を使うようにします。パッチはスレッドセーフな二重チェックロックで守っています。**あくまであなた自身のログインの流用**であって、CLI のネットワーク指紋を偽装するものではありません。リクエストは素の Anthropic SDK 経由で飛びます。
 
   **トークンの鮮度と、CLI との共存。** キャッシュしたトークンが切れていたら、バックエンドはまず CLI 自身の保存先（Keychain／ファイル）を読み直します。CLI が動いていればトークンを新しく保っているので、こちらは何もローテーションせずに相乗りできます。それでも切れているときだけ直接更新しますが、その際は警告をログに残します。直接更新は refresh トークンをローテーションし、CLI が持っているコピーを無効にして `claude` の再ログインを強いかねないためです。この順序のおかげで、ライブラリが黙ってユーザーの CLI ログインを壊すことがありません。
 - **`ApiKeyAuth`** — 環境変数の標準 API キー（`ANTHROPIC_API_KEY`、`OPENAI_API_KEY` など）。内部呼び出しについては、`mem0` が対応するどのプロバイダでもこの経路で動きます。`complete()` は Anthropic と OpenAI についてネイティブに実装済みです。

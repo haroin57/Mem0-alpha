@@ -28,9 +28,24 @@ from .base import AuthBackend
 
 log = logging.getLogger(__name__)
 
-CREDENTIALS_PATH = os.environ.get(
-    "CLAUDE_CLI_CREDENTIALS_PATH", os.path.expanduser("~/.claude/.credentials.json"),
-)
+def _resolve_credentials_path() -> str:
+    """Where the Claude Code CLI keeps its login credentials.
+
+    Same JSON file on Linux, macOS, and Windows: under ``$CLAUDE_CONFIG_DIR``
+    when set, otherwise ``~/.claude``. ``CLAUDE_CLI_CREDENTIALS_PATH`` overrides
+    everything. (On macOS the CLI *also* mirrors these into the Keychain, which
+    we read first — see below.)
+    """
+    override = os.environ.get("CLAUDE_CLI_CREDENTIALS_PATH")
+    if override:
+        return override
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
+        os.path.expanduser("~"), ".claude"
+    )
+    return os.path.join(config_dir, ".credentials.json")
+
+
+CREDENTIALS_PATH = _resolve_credentials_path()
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
@@ -53,7 +68,14 @@ _CREDS_FILE_MODE_MASK = 0o077  # group/other must have no bits set on the file
 
 
 def _verify_path_privacy(path: str, *, is_dir: bool) -> bool:
-    """Return True iff we own `path` (and, for a file, g/o perms are clear)."""
+    """Return True iff we own `path` (and, for a file, g/o perms are clear).
+
+    POSIX only. Windows has no uid/mode bits to check — the credentials file
+    inherits the ACLs of the user profile directory — so the check is skipped
+    there and we rely on the atomic ``os.replace`` write below.
+    """
+    if os.name != "posix":
+        return True
     try:
         st = os.lstat(path)
     except FileNotFoundError:
@@ -152,10 +174,12 @@ def _read_credentials_from_file(path: str | None = None) -> dict | None:
 def _save_credentials(access: str, refresh: str, expires_at: int, *, path: str | None = None) -> None:
     """Write refreshed tokens back to the credentials file (atomic write).
 
-    Defensive ordering: verify the directory and file are privately-owned
-    before touching them, then fchmod the new fd to 0o600 BEFORE any content
-    lands in it, so there's no window where a co-tenant could read a
-    plaintext token off an unprotected tempfile.
+    On POSIX, defensive ordering: verify the directory and file are
+    privately-owned before touching them, then fchmod the new fd to 0o600
+    BEFORE any content lands in it, so there's no window where a co-tenant
+    could read a plaintext token off an unprotected tempfile. On Windows those
+    steps are no-ops — the file inherits the user profile's ACLs — and the
+    atomic ``os.replace`` still applies.
     """
     if path is None:
         path = CREDENTIALS_PATH
@@ -182,7 +206,8 @@ def _save_credentials(access: str, refresh: str, expires_at: int, *, path: str |
 
         fd, tmp_path = tempfile.mkstemp(dir=creds_dir, suffix=".tmp")
         try:
-            os.fchmod(fd, 0o600)
+            if hasattr(os, "fchmod"):  # POSIX; on Windows the file inherits user-profile ACLs
+                os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w") as f:
                 json.dump(data, f)
             os.replace(tmp_path, path)
