@@ -1,10 +1,12 @@
-# llm-mem0
+# Mem0α
 
 Provider-agnostic **long-term memory for LLM agents** — a thin, opinionated
 layer over [`mem0`](https://github.com/mem0ai/mem0) that adds the retrieval-
 and ingestion-quality machinery a conversational agent actually needs, plus a
 pluggable auth layer that can **reuse your existing Claude Code CLI session** so
 you don't have to provision a separate API key.
+
+> Installed as `mem0-alpha`; imported as `llm_mem0`.
 
 ```python
 from llm_mem0 import add_memories, search_memories, format_memories_for_prompt

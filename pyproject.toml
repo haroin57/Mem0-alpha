@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "llm-mem0"
+name = "mem0-alpha"
 version = "0.1.0"
-description = "Provider-agnostic long-term memory for LLM agents — reuses your Claude Code CLI session or any API key"
+description = "Mem0α — provider-agnostic long-term memory for LLM agents; reuses your Claude Code CLI session or any API key"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -37,8 +37,8 @@ japanese = ["janome>=0.5"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23"]
 
 [project.urls]
-Homepage = "https://github.com/haroin/llm-mem0"
-Repository = "https://github.com/haroin/llm-mem0"
+Homepage = "https://github.com/haroin57/Mem0-alpha"
+Repository = "https://github.com/haroin57/Mem0-alpha"
 
 [tool.setuptools.packages.find]
 include = ["llm_mem0*"]
