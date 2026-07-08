@@ -29,6 +29,10 @@ mem0_db/
 .credentials.json
 auth.json
 
+# Local PII pattern list for tests/test_smoke.py::test_no_persona_leakage.
+# The pattern list itself is PII — NEVER commit it.
+tests/pii_patterns.local.txt
+
 # Tooling
 .pytest_cache/
 .mypy_cache/

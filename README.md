@@ -107,6 +107,27 @@ pip install "llm-mem0[openai]"
 pip install "llm-mem0[japanese]"
 ```
 
+## MCP server
+
+Expose Mem0α as a [Model Context Protocol](https://modelcontextprotocol.io) server so MCP clients (Claude Code, Claude Desktop, Cursor, ...) can store and search long-term memory as tools:
+
+```bash
+pip install "mem0-alpha[mcp]"
+mem0-alpha-mcp        # stdio transport
+```
+
+Client config example (Claude Code `.mcp.json` / Claude Desktop):
+
+```json
+{
+  "mcpServers": {
+    "mem0-alpha": { "command": "mem0-alpha-mcp" }
+  }
+}
+```
+
+Tools exposed: `add_memory(user_text, user_id, ...)` stores a conversation turn through the extraction gate; `search_memory(query, user_id, limit, smart)` returns a prompt-ready, injection-safe memory block. Configuration is inherited from the same env vars as the library (see Configuration).
+
 ## Before you run it
 
 - **A vector store.** By default `llm_mem0` talks to a ChromaDB HTTP server:

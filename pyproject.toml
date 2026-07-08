@@ -35,7 +35,12 @@ openai = ["openai>=1.30"]
 # Japanese morphological tokenization for the BM25 index (optional; the index
 # falls back gracefully when absent).
 japanese = ["janome>=0.5"]
+# MCP server wrapper (`mem0-alpha-mcp` command) — see README "MCP server".
+mcp = ["mcp>=1.2"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+mem0-alpha-mcp = "llm_mem0.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/haroin57/Mem0-alpha"
