@@ -85,15 +85,43 @@ def test_sanitize_scrubs_injection_markers():
     assert "ignore the previous" not in clean.lower()
 
 
+def _load_pii_pattern() -> str | None:
+    """PII regex for the leakage test, supplied out-of-band.
+
+    The pattern list itself is PII, so it is never shipped in the public
+    repo. Provide it via the LLM_MEM0_PII_PATTERNS env var (a Python regex),
+    or a git-ignored tests/pii_patterns.local.txt (one regex fragment per
+    line; lines are OR-joined). Returns None when neither is present.
+    """
+    import os
+    import pathlib
+    env = os.environ.get("LLM_MEM0_PII_PATTERNS")
+    if env:
+        return env
+    local = pathlib.Path(__file__).resolve().parent / "pii_patterns.local.txt"
+    if local.exists():
+        lines = [
+            ln.strip()
+            for ln in local.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        if lines:
+            return "|".join(lines)
+    return None
+
+
 def test_no_persona_leakage():
     """The public library must not ship the original persona/PII strings."""
     import pathlib
     import re
+    raw = _load_pii_pattern()
+    if not raw:
+        pytest.skip(
+            "no PII pattern provided (set LLM_MEM0_PII_PATTERNS or create "
+            "tests/pii_patterns.local.txt)"
+        )
     root = pathlib.Path(__file__).resolve().parent.parent / "llm_mem0"
-    pattern = re.compile(
-        r"haroin|b0nchichi|砺波|いぶき|ariiol|ARCRA|栗田|佐々木|佐藤かなえ",
-        re.IGNORECASE,
-    )
+    pattern = re.compile(raw, re.IGNORECASE)
     offenders = []
     for path in root.rglob("*.py"):
         for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
