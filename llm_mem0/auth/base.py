@@ -40,3 +40,11 @@ class AuthBackend(ABC):
     @abstractmethod
     def default_model(self) -> str:
         """A small/fast model name suitable for this backend's helper calls."""
+
+    async def aclose(self) -> None:
+        """Release any cached network clients. Default: nothing to release.
+
+        Long-lived hosts don't need this; embedded hosts and tests that tear
+        down event loops should call :func:`llm_mem0.auth.aclose_auth_backend`
+        (which delegates here) to avoid unclosed-session warnings.
+        """

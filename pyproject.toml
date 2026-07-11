@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mem0-alpha"
-version = "0.1.0"
+version = "0.2.0"
 description = "Mem0α — provider-agnostic long-term memory for LLM agents; reuses your Claude Code CLI session or any API key"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,7 +23,12 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "mem0ai>=0.1.0",
+    # <2: mem0ai 2.x flips search score semantics from distance (small =
+    # similar) to similarity (large = similar), which inverts every relevance
+    # gate and dedup threshold in this library (MEM0_RELEVANCE_MAX_DISTANCE,
+    # DEDUP_HARD_DROP_DISTANCE, ...). Lift the cap only together with a
+    # recalibration of those thresholds.
+    "mem0ai>=1.0,<2",
     "chromadb>=0.5",
     "aiohttp>=3.9",
     "requests>=2.31",
@@ -51,3 +56,6 @@ include = ["llm_mem0*"]
 
 [tool.setuptools.package-data]
 llm_mem0 = ["py.typed"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"

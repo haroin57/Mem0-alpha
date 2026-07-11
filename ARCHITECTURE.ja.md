@@ -18,7 +18,10 @@
 |---|---|
 | `auth/` | 差し替え可能な認証バックエンド（下で詳述） |
 | `client.py` | `mem0.Memory` のシングルトンと設定ビルダ。低レベルの `get_all_memories` / `delete_memory` |
-| `settings.py` | 環境変数ベースの設定の既定値を一箇所にまとめたもの |
+| `settings.py` | 環境変数ベースの設定を一箇所で宣言し、動的に読むもの（`settings.<NAME>` はアクセス時に env を参照。従来の `from settings import X` も PEP 562 で互換） |
+| `llm.py` | ライブラリ自身の単発ヘルパ LLM 呼び出しの共通配管。`complete_json`（補完→フェンス除去→parse→fail-open）、`escape_braces`、`strip_json_fence` |
+| `sqlite_store.py` | `SqliteStore` — 4つのローカル索引ストア共通の SQLite 配管。WAL は DB ファイルごとに1回だけ適用（並行書き込みの行ドロップ修正）、busy_timeout、ロック付き書き込み + 有限リトライ、wipe による再構築。FTS5 MATCH クエリビルダも同居 |
+| `mcp_server.py` | MCP (Model Context Protocol) サーバー。`add_memory` / `search_memory` / `list_memories` / `delete_memory` を stdio で公開 |
 | `ingest.py` | `add_memories` — 取り込みの入口（抽出ゲート、ハッシュによる重複排除、近似重複のマージ、graph / BM25 / fact-store へのインデックス化） |
 | `extract.py` | 小型モデルで、会話ターンから本人の事実とエンティティ間の関係を抽出。分類（カテゴリ・重要度・鮮度）も行う |
 | `dedup.py` | 2段階の重複排除。cosine で候補を絞り、LLM でマージ・衝突を判定する |

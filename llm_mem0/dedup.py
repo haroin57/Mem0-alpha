@@ -1,10 +1,11 @@
 """Two-stage dedup: cosine threshold + LLM judgment for gray zone."""
 
-import asyncio
-import logging
-import os
+from __future__ import annotations
 
-from .format import strip_json_fence
+import logging
+
+from .llm import complete_json, escape_braces
+from .settings import settings
 
 log = logging.getLogger(__name__)
 
@@ -72,10 +73,6 @@ _DEDUP_MERGE_PROMPT = """次の2つの記憶は同じ事実を別の粒度・側
 _VALID_RELATIONS = ("paraphrase", "mergeable", "different")
 
 
-def _strip_json_fence(text: str) -> str:
-    return strip_json_fence(text)
-
-
 async def judge_fact_relation(existing_text: str, candidate_text: str) -> str:
     """Classify the relation between two facts.
 
@@ -83,30 +80,21 @@ async def judge_fact_relation(existing_text: str, candidate_text: str) -> str:
     On any error, returns ``different`` (fail-open: keep both, never drop
     or merge on a judge failure).
     """
-    try:
-        from .auth import get_auth_backend
-        backend = get_auth_backend()
-        safe_existing = existing_text[:300].replace("{", "{{").replace("}", "}}")
-        safe_candidate = candidate_text[:300].replace("{", "{{").replace("}", "}}")
-        text = strip_json_fence(await backend.complete(
-            system=(
-                "You classify the relation between two short fact statements "
-                "as paraphrase / mergeable / different. Return JSON only."
-            ),
-            user_message=_DEDUP_RELATION_PROMPT.format(
-                existing=safe_existing, candidate=safe_candidate,
-            ),
-            model=os.environ.get("MEM0_DEDUP_MODEL", "claude-haiku-4-5-20251001"),
-            max_tokens=1500,
-        ))
-        if not text:
-            return "different"
-        import json as _json
-        relation = _json.loads(text).get("relation")
-        return relation if relation in _VALID_RELATIONS else "different"
-    except Exception as exc:
-        log.warning("dedup relation judge failed (fail-open=different): %s", exc)
-        return "different"
+    data = await complete_json(
+        system=(
+            "You classify the relation between two short fact statements "
+            "as paraphrase / mergeable / different. Return JSON only."
+        ),
+        user_message=_DEDUP_RELATION_PROMPT.format(
+            existing=escape_braces(existing_text, limit=300),
+            candidate=escape_braces(candidate_text, limit=300),
+        ),
+        model=settings.MEM0_DEDUP_MODEL,
+        max_tokens=settings.MEM0_DEDUP_MAX_TOKENS,
+        caller="dedup.judge_fact_relation",
+    )
+    relation = (data or {}).get("relation") if isinstance(data, dict) else None
+    return relation if relation in _VALID_RELATIONS else "different"
 
 
 async def llm_judge_same_fact(existing_text: str, candidate_text: str) -> bool:
@@ -126,32 +114,23 @@ async def synthesize_facts(existing_text: str, candidate_text: str) -> str | Non
     Returns the synthesized fact text, or ``None`` on any error (fail-open:
     the caller keeps both facts rather than losing information).
     """
-    try:
-        from .auth import get_auth_backend
-        backend = get_auth_backend()
-        safe_existing = existing_text[:400].replace("{", "{{").replace("}", "}}")
-        safe_candidate = candidate_text[:400].replace("{", "{{").replace("}", "}}")
-        text = strip_json_fence(await backend.complete(
-            system=(
-                "You merge two overlapping fact statements into a single fact "
-                "that preserves every concrete detail. Return JSON only."
-            ),
-            user_message=_DEDUP_MERGE_PROMPT.format(
-                existing=safe_existing, candidate=safe_candidate,
-            ),
-            model=os.environ.get("MEM0_DEDUP_MERGE_MODEL", "claude-haiku-4-5-20251001"),
-            max_tokens=1500,
-        ))
-        if not text:
-            return None
-        import json as _json
-        merged = _json.loads(text).get("merged")
-        if isinstance(merged, str) and merged.strip():
-            return merged.strip()
-        return None
-    except Exception as exc:
-        log.warning("dedup synthesize failed (fail-open=keep-both): %s", exc)
-        return None
+    data = await complete_json(
+        system=(
+            "You merge two overlapping fact statements into a single fact "
+            "that preserves every concrete detail. Return JSON only."
+        ),
+        user_message=_DEDUP_MERGE_PROMPT.format(
+            existing=escape_braces(existing_text, limit=400),
+            candidate=escape_braces(candidate_text, limit=400),
+        ),
+        model=settings.MEM0_DEDUP_MERGE_MODEL,
+        max_tokens=settings.MEM0_DEDUP_MAX_TOKENS,
+        caller="dedup.synthesize_facts",
+    )
+    merged = (data or {}).get("merged") if isinstance(data, dict) else None
+    if isinstance(merged, str) and merged.strip():
+        return merged.strip()
+    return None
 
 
 _CLUSTER_CONSOLIDATE_PROMPT = """次の複数の記憶は同じ話題について別々のタイミングで保存されたものです。
@@ -185,37 +164,27 @@ async def synthesize_cluster(texts: list[str]) -> list[str] | None:
     facts = [t for t in (texts or []) if isinstance(t, str) and t.strip()]
     if len(facts) < 2:
         return None
-    try:
-        from .auth import get_auth_backend
-        backend = get_auth_backend()
-        safe = "\n".join(
-            f"- {t[:300].replace('{', '{{').replace('}', '}}')}" for t in facts
-        )
-        text = strip_json_fence(await backend.complete(
-            system=(
-                "You consolidate a cluster of redundant memory facts into "
-                "fewer facts, preserving every concrete detail and the latest "
-                "state. Return JSON only."
-            ),
-            user_message=_CLUSTER_CONSOLIDATE_PROMPT.format(facts=safe),
-            model=os.environ.get("MEM0_DEDUP_MERGE_MODEL", "claude-haiku-4-5-20251001"),
-            max_tokens=1500,
-        ))
-        if not text:
-            return None
-        import json as _json
-        out = _json.loads(text)
-        consolidated = out.get("consolidated")
-        if not isinstance(consolidated, list):
-            return None
-        consolidated = [c.strip() for c in consolidated if isinstance(c, str) and c.strip()]
-        # Must actually reduce the count; otherwise it's a no-op (skip).
-        if not consolidated or len(consolidated) >= len(facts):
-            return None
-        return consolidated
-    except Exception as exc:
-        log.warning("cluster consolidate failed (fail-open=skip): %s", exc)
+    data = await complete_json(
+        system=(
+            "You consolidate a cluster of redundant memory facts into "
+            "fewer facts, preserving every concrete detail and the latest "
+            "state. Return JSON only."
+        ),
+        user_message=_CLUSTER_CONSOLIDATE_PROMPT.format(
+            facts="\n".join(f"- {escape_braces(t, limit=300)}" for t in facts),
+        ),
+        model=settings.MEM0_DEDUP_MERGE_MODEL,
+        max_tokens=settings.MEM0_DEDUP_MAX_TOKENS,
+        caller="dedup.synthesize_cluster",
+    )
+    consolidated = (data or {}).get("consolidated") if isinstance(data, dict) else None
+    if not isinstance(consolidated, list):
         return None
+    consolidated = [c.strip() for c in consolidated if isinstance(c, str) and c.strip()]
+    # Must actually reduce the count; otherwise it's a no-op (skip).
+    if not consolidated or len(consolidated) >= len(facts):
+        return None
+    return consolidated
 
 
 async def partition_mergeable(texts: list[str]) -> list[list[int]]:
@@ -319,7 +288,13 @@ async def check_near_dup(
     where a mergeable superset is dropped like a paraphrase.
     """
     for r in near_results:
-        score = r.get("score") or 0
+        score = r.get("score")
+        if score is None:
+            # A scoreless neighbor (e.g. graph-expanded rows before their
+            # placeholder is set) carries no distance signal. Treating it as
+            # distance 0 would hard-drop the candidate as an exact duplicate;
+            # skip the neighbor instead (fail-open: keep the candidate).
+            continue
         existing_text = r.get("memory", "")
         existing_id = r.get("id")
 

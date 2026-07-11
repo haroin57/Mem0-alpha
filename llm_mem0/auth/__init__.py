@@ -50,10 +50,23 @@ def reset_auth_backend() -> None:
     _backend = None
 
 
+async def aclose_auth_backend() -> None:
+    """Close the cached backend's network clients and clear the singleton.
+
+    For embedded hosts / tests that build and tear down event loops; a
+    long-lived process can simply exit without calling this.
+    """
+    global _backend
+    backend, _backend = _backend, None
+    if backend is not None:
+        await backend.aclose()
+
+
 __all__ = [
     "AuthBackend",
     "AnthropicCliAuth",
     "ApiKeyAuth",
+    "aclose_auth_backend",
     "get_auth_backend",
     "reset_auth_backend",
 ]

@@ -121,12 +121,24 @@ Client config example (Claude Code `.mcp.json` / Claude Desktop):
 ```json
 {
   "mcpServers": {
-    "mem0-alpha": { "command": "mem0-alpha-mcp" }
+    "mem0-alpha": {
+      "command": "mem0-alpha-mcp",
+      "env": { "MEM0_DEFAULT_USER_ID": "you" }
+    }
   }
 }
 ```
 
-Tools exposed: `add_memory(user_text, user_id, ...)` stores a conversation turn through the extraction gate; `search_memory(query, user_id, limit, smart)` returns a prompt-ready, injection-safe memory block. Configuration is inherited from the same env vars as the library (see Configuration).
+Tools exposed:
+
+| Tool | What it does |
+|---|---|
+| `add_memory(user_text, …)` | Store a conversation turn through the extraction gate. Errors (store down, pipeline failure) are surfaced in the tool result instead of a fake success. |
+| `search_memory(query, limit, smart)` | Prompt-ready, injection-safe memory block. `smart=true` adds query-rewrite + LLM rerank. |
+| `list_memories(limit)` | One line per memory with its ID, importance/tier, and text — for review and housekeeping. |
+| `delete_memory(memory_id)` | Delete one memory and scrub it from the side indices (entity graph, BM25) so hybrid recall can't resurface it. |
+
+`user_id` is optional on every tool when `MEM0_DEFAULT_USER_ID` is set in the server env (recommended for single-user clients). Other configuration is inherited from the same env vars as the library (see Configuration).
 
 ## Before you run it
 
@@ -168,6 +180,7 @@ Everything is an environment variable with a safe default (all defined in
 | `MEM0_LLM_MODEL` | backend default | model for extraction, dedup, and reranking |
 | `MEM0_EMBEDDER_PROVIDER` / `MEM0_EMBEDDER_MODEL` | `openai` / `text-embedding-3-small` | the embedder |
 | `LLM_MEM0_STATE_DIR` | `~/.llm_mem0/state` | sqlite indices and embedded Chroma |
+| `MEM0_DEFAULT_USER_ID` | (unset) | default `user_id` for the MCP tools |
 | `MEM0_HYBRID_ENABLED` | `true` | fuse BM25 with vector search |
 | `MEM0_HYDE_ENABLED` | `true` | widen the query with a hypothetical answer (HyDE) |
 

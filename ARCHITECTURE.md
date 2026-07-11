@@ -35,7 +35,10 @@ Mem0α fixes:
 |---|---|
 | `auth/` | Pluggable auth backends (detailed below). |
 | `client.py` | The `mem0.Memory` singleton and config builder; low-level `get_all_memories` / `delete_memory`. |
-| `settings.py` | Every env-var-backed default, in one place. |
+| `settings.py` | Every env-var-backed setting, declared once and read dynamically (`settings.<NAME>` hits the env at access time; legacy `from settings import X` still works via PEP 562). |
+| `llm.py` | Shared plumbing for the library's own single-shot helper calls: `complete_json` (completion → fence-strip → parse → fail-open), `escape_braces`, `strip_json_fence`. |
+| `sqlite_store.py` | `SqliteStore` — shared SQLite plumbing for the four index stores: WAL applied once per DB file (the concurrent-write row-drop fix), busy_timeout, locked writes with bounded retry, wipe-and-rebuild; plus the FTS5 MATCH-query builder. |
+| `mcp_server.py` | MCP (Model Context Protocol) server exposing `add_memory` / `search_memory` / `list_memories` / `delete_memory` over stdio. |
 | `ingest.py` | `add_memories` — the ingestion entry point (extraction gate, hash dedup, near-duplicate merge, graph/BM25/fact-store indexing). |
 | `extract.py` | Small-model extraction of the user's facts and entity relations from a turn; classification (category, importance, tier). |
 | `dedup.py` | Two-stage dedup: cosine candidate gate, then an LLM merge/conflict decision. |

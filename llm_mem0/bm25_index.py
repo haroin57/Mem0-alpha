@@ -18,18 +18,17 @@ what ``search_bm25`` returns as ``memory``; the indexed ``text`` column is for
 matching only and must never be surfaced to a consumer/LLM.
 
 The module is synchronous; callers wrap with ``asyncio.to_thread`` from event
-loops. A single ``_db_lock`` serializes writes; FTS5 reads are concurrent-safe
-under WAL.
+loops. Connection plumbing (WAL-once init, locked writes with retry) lives in
+:mod:`llm_mem0.sqlite_store`.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import sqlite3
-import threading
-from contextlib import contextmanager
 from typing import Iterable
+
+from .sqlite_store import SqliteStore, build_fts_match_query
 
 log = logging.getLogger(__name__)
 
@@ -44,38 +43,24 @@ CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
 );
 """
 
-
-_db_lock = threading.Lock()
-_db_path: str | None = None
-
-
-def _resolve_db_path() -> str:
-    global _db_path
-    if _db_path is None:
-        from .settings import STATE_DIR
-        os.makedirs(STATE_DIR, exist_ok=True)
-        _db_path = os.path.join(STATE_DIR, "mem0_bm25.sqlite")
-    return _db_path
+_store = SqliteStore("mem0_bm25.sqlite", _SCHEMA)
 
 
 def _reset_db_path_for_test(path: str | None) -> None:
     """Test hook — pytest fixtures point the module at a tempfile."""
-    global _db_path
-    _db_path = path
+    _store.reset_path_for_test(path)
 
 
-@contextmanager
-def _conn():
-    path = _resolve_db_path()
-    c = sqlite3.connect(path, check_same_thread=False)
-    c.row_factory = sqlite3.Row
+def _tokenize(text: str) -> str:
     try:
-        c.execute("PRAGMA journal_mode=WAL")
-        with _db_lock:
-            c.executescript(_SCHEMA)
-        yield c
-    finally:
-        c.close()
+        from . import morpho
+        tokenized = morpho.tokenize_for_index(text)
+    except Exception as exc:
+        log.warning(
+            "bm25 morpho tokenize_for_index failed, falling back to raw: %s", exc,
+        )
+        tokenized = text
+    return tokenized or text  # never index an empty row
 
 
 def index_fact(fact_id: str, text: str, user_id: str) -> bool:
@@ -94,45 +79,30 @@ def index_fact(fact_id: str, text: str, user_id: str) -> bool:
     """
     if not fact_id or not text or not user_id:
         return False
-    try:
-        from . import morpho
-        tokenized = morpho.tokenize_for_index(text)
-    except Exception as exc:
-        log.warning(
-            "bm25 morpho tokenize_for_index failed, falling back to raw: %s", exc,
+    tokenized = _tokenize(text)
+
+    def _insert(c) -> bool:
+        c.execute("DELETE FROM facts_fts WHERE fact_id = ?", (fact_id,))
+        c.execute(
+            "INSERT INTO facts_fts(fact_id, user_id, orig_text, text) "
+            "VALUES (?, ?, ?, ?)",
+            (fact_id, user_id, text, tokenized),
         )
-        tokenized = text
-    try:
-        with _conn() as c, _db_lock:
-            c.execute(
-                "DELETE FROM facts_fts WHERE fact_id = ?", (fact_id,),
-            )
-            c.execute(
-                "INSERT INTO facts_fts(fact_id, user_id, orig_text, text) "
-                "VALUES (?, ?, ?, ?)",
-                (fact_id, user_id, text, tokenized),
-            )
-            c.commit()
-            return True
-    except Exception as exc:
-        log.warning("bm25 index_fact(%s) failed: %s", fact_id, exc)
-        return False
+        return True
+
+    return bool(_store.write(_insert, what="index_fact", default=False))
 
 
 def remove_fact(fact_id: str) -> int:
     """Drop a fact from the FTS5 index. Returns rowcount removed."""
     if not fact_id:
         return 0
-    try:
-        with _conn() as c, _db_lock:
-            cur = c.execute(
-                "DELETE FROM facts_fts WHERE fact_id = ?", (fact_id,),
-            )
-            c.commit()
-            return cur.rowcount or 0
-    except Exception as exc:
-        log.warning("bm25 remove_fact(%s) failed: %s", fact_id, exc)
-        return 0
+
+    def _delete(c) -> int:
+        cur = c.execute("DELETE FROM facts_fts WHERE fact_id = ?", (fact_id,))
+        return cur.rowcount or 0
+
+    return _store.write(_delete, what="remove_fact", default=0) or 0
 
 
 def search_bm25(query: str, user_id: str, limit: int = 20) -> list[dict]:
@@ -143,79 +113,48 @@ def search_bm25(query: str, user_id: str, limit: int = 20) -> list[dict]:
     ``bm25()`` is "smaller is better"; callers that just need ranking can
     ignore the absolute value.
 
-    Sanitization: FTS5 has a small DSL ('AND', 'OR', '"phrase"', column
-    filters). Wrapping the whole query in one big "phrase" only works for
-    short proper nouns — for natural-language questions ("東京タワーの高さは
-    何メートル？") no stored fact contains the entire phrase verbatim, so
-    BM25 returns zero hits. We instead split on Japanese + ASCII
-    punctuation/whitespace, drop FTS5 special characters, and OR-join
-    the resulting sub-phrases. Matching is exact-token (unicode61), not
-    substring: morpho splits both the stored fact and the query into the
-    same content words, so "東京タワー" → "東京" / "タワー" matches the
-    standalone tokens indexed from a longer fact.
+    The query goes through :func:`build_fts_match_query`: content-word
+    tokenization (Janome when available, punctuation split otherwise), FTS5
+    syntax characters stripped, and the survivors OR-joined as phrases.
+    Matching is exact-token (unicode61), not substring: morpho splits both
+    the stored fact and the query into the same content words, so
+    "東京タワー" → "東京" / "タワー" matches the standalone tokens indexed
+    from a longer fact.
     """
     q = (query or "").strip()
     if not q or not user_id:
         return []
-    # Phase A-1 follow-up: tokenize the query via Janome so each FTS5
-    # disjunct is a single content word ("東京" / "タワー" / "好き"),
-    # not a chunk of natural-language soup. Particles, symbols, and
-    # 1-char noise are stripped upstream by morpho.tokenize_keywords.
-    try:
-        from . import morpho
-        tokens = morpho.tokenize_keywords(q)
-    except Exception as exc:
-        log.warning("bm25 morpho tokenize failed, falling back: %s", exc)
-        tokens = []
-    # Fallback when Janome is unavailable: split on whitespace +
-    # Japanese punctuation, drop FTS5 syntax chars, keep tokens >=2 chars.
-    if not tokens:
-        import re as _re
-        cleaned = _re.sub(r'["\(\)\*\^:]', " ", q)
-        sub_phrases = _re.split(r"[\s、。？！,.?!:;~〜\-—]+", cleaned)
-        tokens = [t.strip() for t in sub_phrases if len(t.strip()) >= 2]
-    if not tokens:
+    fts_query = build_fts_match_query(q)
+    if not fts_query:
         return []
-    # Strip FTS5 syntax inside each token in case the morpho layer let
-    # one through (e.g. embedded paren in an English token).
-    import re as _re
-    safe_tokens = [_re.sub(r'["\(\)\*\^:]', "", t) for t in tokens[:10]]
-    safe_tokens = [t for t in safe_tokens if t]
-    if not safe_tokens:
-        return []
-    # OR-join each content word as a phrase. unicode61 tokenizer splits
-    # the index entries on whitespace, so a phrase like "東京" matches
-    # the standalone FTS5 token "東京" in any indexed fact.
-    fts_query = " OR ".join(f'"{t}"' for t in safe_tokens)
+
+    def _search(c) -> list[dict]:
+        rows = c.execute(
+            "SELECT fact_id, orig_text, bm25(facts_fts) AS score "
+            "FROM facts_fts "
+            "WHERE facts_fts MATCH ? AND user_id = ? "
+            "ORDER BY bm25(facts_fts) "
+            "LIMIT ?",
+            (fts_query, user_id, max(int(limit), 1)),
+        ).fetchall()
+        return [
+            {
+                "id": r["fact_id"],
+                # Return the original sentence (orig_text), never the
+                # tokenized `text` column — the latter is for FTS5 matching
+                # only and would surface as keyword-soup to the LLM reranker.
+                "memory": r["orig_text"],
+                "rank": i + 1,
+                "bm25_score": float(r["score"]),
+            }
+            for i, r in enumerate(rows)
+        ]
+
     try:
-        with _conn() as c:
-            rows = c.execute(
-                "SELECT fact_id, orig_text, bm25(facts_fts) AS score "
-                "FROM facts_fts "
-                "WHERE facts_fts MATCH ? AND user_id = ? "
-                "ORDER BY bm25(facts_fts) "
-                "LIMIT ?",
-                (fts_query, user_id, max(int(limit), 1)),
-            ).fetchall()
-    except sqlite3.OperationalError as exc:
-        # Malformed FTS5 query (e.g. lone parens). Log and fall back to empty.
+        return _store.read(_search, what="search_bm25", default=[]) or []
+    except sqlite3.OperationalError as exc:  # pragma: no cover - defensive
         log.warning("bm25 search OperationalError: %s (q=%r)", exc, q[:80])
         return []
-    except Exception as exc:
-        log.warning("bm25 search failed: %s", exc)
-        return []
-    out: list[dict] = []
-    for i, r in enumerate(rows):
-        out.append({
-            "id": r["fact_id"],
-            # Return the original sentence (orig_text), never the tokenized
-            # `text` column — the latter is for FTS5 matching only and would
-            # surface as keyword-soup to the prompt and the LLM reranker.
-            "memory": r["orig_text"],
-            "rank": i + 1,
-            "bm25_score": float(r["score"]),
-        })
-    return out
 
 
 def rrf_merge(
@@ -268,7 +207,7 @@ def rrf_merge(
     # ChromaDB full sentence, never the FTS5 tokenized form. vector_hits are
     # bumped BEFORE bm25_hits and the existing-id branch in _bump never
     # overwrites `memory`, so a fact that also hit via vector keeps its full
-    # text. search_bm25 now returns orig_text (the raw sentence) as memory,
+    # text. search_bm25 returns orig_text (the raw sentence) as memory,
     # so a BM25-only id is safe too. Do NOT re-point search_bm25 at the
     # tokenized `text` column or this invariant breaks silently.
     for i, item in enumerate(vector_hits or []):
@@ -285,60 +224,36 @@ def rrf_merge(
 def reindex_all(facts: Iterable[tuple[str, str, str]]) -> int:
     """Wipe-and-rebuild the FTS5 index from an iterable of (fact_id, text, user_id).
 
-    Used by ``scripts/build_mem0_bm25_index.py`` after dumping every Mem0 fact
-    from ChromaDB. Each fact's text is morphologically tokenized via
-    the morpho module before insertion. Returns the row count.
+    Used by index-rebuild scripts after dumping every Mem0 fact from
+    ChromaDB. Each fact's text is morphologically tokenized before
+    insertion. Returns the row count.
 
     SQLite virtual tables can't change their ``tokenize=`` option after
-    creation — so when the schema in _SCHEMA changes (e.g. trigram →
-    unicode61) we must wipe the underlying file, not just DELETE the
-    rows. We unlink the sqlite + WAL/SHM siblings so the next _conn()
-    call recreates everything from the current _SCHEMA.
+    creation — so when ``_SCHEMA`` changes we must wipe the underlying file,
+    not just DELETE the rows; the next connection recreates everything from
+    the current schema.
     """
-    path = _resolve_db_path()
-    with _db_lock:
-        import os as _os
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                _os.unlink(path + suffix)
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                log.warning("bm25 reindex_all: unlink %s%s failed: %s",
-                            path, suffix, exc)
+    _store.wipe()
 
-    count = 0
-    try:
-        # The first _conn() after the unlink recreates the file under
-        # the current schema.
-        with _conn() as c, _db_lock:
-            try:
-                from . import morpho
-                _tokenize = morpho.tokenize_for_index
-            except Exception:
-                _tokenize = lambda s: s  # noqa: E731
-            for fid, text, uid in facts:
-                if not fid or not text or not uid:
-                    continue
-                tokenized = _tokenize(text)
-                if not tokenized:
-                    tokenized = text  # never index an empty row
-                c.execute(
-                    "INSERT INTO facts_fts(fact_id, user_id, orig_text, text) "
-                    "VALUES (?, ?, ?, ?)",
-                    (fid, uid, text, tokenized),
-                )
-                count += 1
-            c.commit()
-    except Exception as exc:
-        log.warning("bm25 reindex_all failed at %d: %s", count, exc)
-    return count
+    def _insert_all(c) -> int:
+        count = 0
+        for fid, text, uid in facts:
+            if not fid or not text or not uid:
+                continue
+            c.execute(
+                "INSERT INTO facts_fts(fact_id, user_id, orig_text, text) "
+                "VALUES (?, ?, ?, ?)",
+                (fid, uid, text, _tokenize(text)),
+            )
+            count += 1
+        return count
+
+    return _store.write(_insert_all, what="reindex_all", default=0) or 0
 
 
 def stats() -> dict:
-    try:
-        with _conn() as c:
-            total = c.execute("SELECT count(*) FROM facts_fts").fetchone()[0]
-    except Exception:
-        total = -1
-    return {"rows": total, "db_path": _resolve_db_path()}
+    total = _store.read(
+        lambda c: c.execute("SELECT count(*) FROM facts_fts").fetchone()[0],
+        what="stats", default=-1,
+    )
+    return {"rows": total, "db_path": _store.resolve_path()}

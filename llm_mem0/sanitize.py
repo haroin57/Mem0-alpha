@@ -91,14 +91,8 @@ def sanitize_untrusted_text(text: str) -> str:
 
 
 def apply_sentinel_filters(text: str) -> str:
-    """Normalize then sanitize untrusted text in one call.
-
-    Equivalent to ``sanitize_untrusted_text(normalize_for_sentinel(text))``,
-    gaining Unicode-bypass protection.
-    """
+    """Normalize then sanitize untrusted text in one call, gaining
+    Unicode-bypass protection."""
     if not text:
         return text
-    text = normalize_for_sentinel(text)
-    text = SENTINEL_RE.sub("[redacted-marker]", text)
-    text = POWER_PHRASE_RE.sub("[redacted]", text)
-    return text
+    return sanitize_untrusted_text(normalize_for_sentinel(text))

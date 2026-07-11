@@ -1,48 +1,49 @@
 """Memory store singleton (mem0/Chroma) + low-level housekeeping (get_all/delete)."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
+import threading
 import time
 
 from .auth import get_auth_backend
-from .settings import STATE_DIR
+from .settings import settings
 
 log = logging.getLogger(__name__)
 
+# Back-compat module constants. The live values are settings.* (dynamic);
+# these freeze at import for callers that import them directly, exactly as
+# they always did.
+#
 # The Chroma adapter returns score = distance (small = similar).
-# Pre-rerank gate: applied inside search_memories() to drop candidates
-# that are physically too far before the LLM rerank ever sees them. Also
-# used as the sanity gate for the rerank=False path in
-# search_memories_smart.
-MEM0_RELEVANCE_MAX_DISTANCE = float(
-    os.environ.get("MEM0_RELEVANCE_MAX_DISTANCE", "1.2")
-)
-# DEPRECATED. Previously gated the output of search_memories_smart at 0.65 —
-# but cosine distance is a poor judge after an LLM rerank has already
-# accepted the fact, and 0.65 was pessimistic enough to silently kill a lot
-# of conversational (non-English) queries. search_memories_smart no longer
-# references this on the rerank=True path. Kept so env config that sets the
-# var still imports.
-MEM0_FINAL_RELEVANCE_MAX_DISTANCE = float(
-    os.environ.get("MEM0_FINAL_RELEVANCE_MAX_DISTANCE", "0.65")
-)
+# MEM0_RELEVANCE_MAX_DISTANCE is the pre-rerank gate applied inside
+# search_memories() to drop candidates that are physically too far before
+# the LLM rerank ever sees them; also the sanity gate for the rerank=False
+# path in search_memories_smart.
+MEM0_RELEVANCE_MAX_DISTANCE = settings.MEM0_RELEVANCE_MAX_DISTANCE
+# DEPRECATED — see settings.py. Kept so env config that sets it still imports.
+MEM0_FINAL_RELEVANCE_MAX_DISTANCE = settings.MEM0_FINAL_RELEVANCE_MAX_DISTANCE
 # Back-compat alias for any caller still importing the old name. Semantic is
 # "max distance" (not "min similarity") — do not flip it.
 MEM0_RELEVANCE_THRESHOLD = MEM0_RELEVANCE_MAX_DISTANCE
 
 _mem0_instance = None
+_mem0_provider: str | None = None
 # Last init failure timestamp (monotonic seconds). When set, _get_mem0()
 # returns None without re-trying until _INIT_RETRY_COOLDOWN_SEC has elapsed.
 # This allows automatic recovery after a transient ChromaDB outage instead of
 # permanently disabling the store after the first failure.
 _init_failed_at: float | None = None
 _INIT_RETRY_COOLDOWN_SEC = 60.0
-_mem0_provider: str | None = None
+# _get_mem0 is called via asyncio.to_thread from several coroutines at once;
+# without a lock two threads could both run the (multi-second) init.
+_init_lock = threading.Lock()
 
 
 def _build_config() -> dict:
-    """Build mem0 configuration from env vars.
+    """Build mem0 configuration from settings.
 
     CHROMA_MODE=server (default): connect to a Chroma HTTP server at
     CHROMA_HOST:CHROMA_PORT. This avoids the multi-process write race that
@@ -51,49 +52,37 @@ def _build_config() -> dict:
     CHROMA_MODE=embedded: direct on-disk access under STATE_DIR (single
     process only).
     """
-    chroma_mode = os.environ.get("CHROMA_MODE", "server")
-    chroma_host = os.environ.get("CHROMA_HOST", "127.0.0.1")
-    chroma_port = int(os.environ.get("CHROMA_PORT", "8765"))
-    collection_name = os.environ.get("MEM0_COLLECTION_NAME", "memories")
-
-    if chroma_mode == "server":
+    if settings.CHROMA_MODE == "server":
         vector_cfg = {
-            "collection_name": collection_name,
-            "host": chroma_host,
-            "port": chroma_port,
+            "collection_name": settings.MEM0_COLLECTION_NAME,
+            "host": settings.CHROMA_HOST,
+            "port": settings.CHROMA_PORT,
         }
     else:
-        db_path = os.path.join(STATE_DIR, "mem0_db")
+        db_path = os.path.join(settings.STATE_DIR, "mem0_db")
         os.makedirs(db_path, exist_ok=True)
         vector_cfg = {
-            "collection_name": collection_name,
+            "collection_name": settings.MEM0_COLLECTION_NAME,
             "path": db_path,
         }
 
     backend = get_auth_backend()
-    llm_model = os.environ.get("MEM0_LLM_MODEL", backend.default_model())
-    llm_cfg = backend.mem0_llm_config(model=llm_model)
+    llm_model = settings.MEM0_LLM_MODEL or backend.default_model()
 
-    config: dict = {
-        "llm": llm_cfg,
+    return {
+        "llm": backend.mem0_llm_config(model=llm_model),
         "vector_store": {
             "provider": "chroma",
             "config": vector_cfg,
         },
+        "embedder": {
+            "provider": settings.MEM0_EMBEDDER_PROVIDER,
+            "config": {
+                "model": settings.MEM0_EMBEDDER_MODEL,
+            },
+        },
         "version": "v1.1",
     }
-
-    # Embedder — defaults to OpenAI text-embedding-3-small.
-    embedder_provider = os.environ.get("MEM0_EMBEDDER_PROVIDER", "openai")
-    embedder_model = os.environ.get("MEM0_EMBEDDER_MODEL", "text-embedding-3-small")
-    config["embedder"] = {
-        "provider": embedder_provider,
-        "config": {
-            "model": embedder_model,
-        },
-    }
-
-    return config
 
 
 def _ping_chromadb_if_server_mode() -> None:
@@ -102,12 +91,13 @@ def _ping_chromadb_if_server_mode() -> None:
     Raises an exception on failure so the caller can mark init as failed
     and trigger the cooldown-based retry path.
     """
-    if os.environ.get("CHROMA_MODE", "server") != "server":
+    if settings.CHROMA_MODE != "server":
         return
-    host = os.environ.get("CHROMA_HOST", "127.0.0.1")
-    port = int(os.environ.get("CHROMA_PORT", "8765"))
     import requests
-    r = requests.get(f"http://{host}:{port}/api/v2/heartbeat", timeout=5)
+    r = requests.get(
+        f"http://{settings.CHROMA_HOST}:{settings.CHROMA_PORT}/api/v2/heartbeat",
+        timeout=5,
+    )
     r.raise_for_status()
 
 
@@ -118,37 +108,98 @@ def _get_mem0():
     _INIT_RETRY_COOLDOWN_SEC seconds before retrying, so a transient
     ChromaDB outage recovers automatically instead of disabling the store
     for the rest of the process lifetime.
+
+    NOTE: first init does a synchronous ChromaDB heartbeat +
+    Memory.from_config; call via ``asyncio.to_thread`` from event loops.
     """
     global _mem0_instance, _mem0_provider, _init_failed_at
 
     if _mem0_instance is not None:
         return _mem0_instance
-    if _init_failed_at is not None and (time.monotonic() - _init_failed_at) < _INIT_RETRY_COOLDOWN_SEC:
-        return None
 
-    try:
-        _ping_chromadb_if_server_mode()
-        from mem0 import Memory
+    with _init_lock:
+        if _mem0_instance is not None:
+            return _mem0_instance
+        if (
+            _init_failed_at is not None
+            and (time.monotonic() - _init_failed_at) < _INIT_RETRY_COOLDOWN_SEC
+        ):
+            return None
+        try:
+            _ping_chromadb_if_server_mode()
+            from mem0 import Memory
 
-        cfg = _build_config()
-        _mem0_instance = Memory.from_config(cfg)
-        _mem0_provider = cfg["llm"]["provider"]
-        _init_failed_at = None
-        vs_cfg = cfg["vector_store"]["config"]
-        store_id = vs_cfg.get("path") or f'{vs_cfg.get("host")}:{vs_cfg.get("port")}'
-        log.info(
-            "mem0 ready — llm=%s provider=%s embedder=%s store=chroma(%s)",
-            cfg["llm"]["config"]["model"],
-            cfg["llm"]["provider"],
-            cfg["embedder"]["config"]["model"],
-            store_id,
-        )
-    except Exception as exc:
-        log.error("mem0 init failed: %s", exc, exc_info=True)
-        _mem0_instance = None
-        _init_failed_at = time.monotonic()
+            cfg = _build_config()
+            _mem0_instance = Memory.from_config(cfg)
+            _mem0_provider = cfg["llm"]["provider"]
+            _init_failed_at = None
+            vs_cfg = cfg["vector_store"]["config"]
+            store_id = vs_cfg.get("path") or f'{vs_cfg.get("host")}:{vs_cfg.get("port")}'
+            log.info(
+                "mem0 ready — llm=%s provider=%s embedder=%s store=chroma(%s)",
+                cfg["llm"]["config"]["model"],
+                cfg["llm"]["provider"],
+                cfg["embedder"]["config"]["model"],
+                store_id,
+            )
+        except Exception as exc:
+            log.error("mem0 init failed: %s", exc, exc_info=True)
+            _mem0_instance = None
+            _init_failed_at = time.monotonic()
 
     return _mem0_instance
+
+
+# ---------------------------------------------------------------------------
+# mem0ai API-generation compat
+# ---------------------------------------------------------------------------
+# mem0ai changed its retrieval API around 1.1: `user_id` moved from a
+# top-level kwarg into ``filters={"user_id": ...}`` for search()/get_all()
+# (add() still accepts the kwarg). We support both generations without
+# pinning: try the legacy call first, and when the SDK rejects it switch
+# styles for the rest of the process.
+_filters_style: bool | None = None  # None=unknown, False=legacy kwarg, True=filters dict
+
+
+def _rejects_user_id_kwarg(exc: Exception) -> bool:
+    return "Top-level entity parameters" in str(exc)
+
+
+def mem_search(mem, *, query: str, user_id: str, limit: int):
+    """``mem.search`` across mem0ai API generations. Sync — wrap in to_thread."""
+    global _filters_style
+    if _filters_style:
+        return mem.search(query=query, filters={"user_id": user_id}, limit=limit)
+    try:
+        result = mem.search(query=query, user_id=user_id, limit=limit)
+        _filters_style = False
+        return result
+    except Exception as exc:
+        if not _rejects_user_id_kwarg(exc):
+            raise
+        log.info("mem0 SDK uses filters-style params; switching")
+        _filters_style = True
+        return mem.search(query=query, filters={"user_id": user_id}, limit=limit)
+
+
+def mem_get_all(mem, *, user_id: str, limit: int | None = None):
+    """``mem.get_all`` across mem0ai API generations. Sync — wrap in to_thread."""
+    global _filters_style
+    kwargs: dict = {}
+    if limit is not None:
+        kwargs["limit"] = limit
+    if _filters_style:
+        return mem.get_all(filters={"user_id": user_id}, **kwargs)
+    try:
+        result = mem.get_all(user_id=user_id, **kwargs)
+        _filters_style = False
+        return result
+    except Exception as exc:
+        if not _rejects_user_id_kwarg(exc):
+            raise
+        log.info("mem0 SDK uses filters-style params; switching")
+        _filters_style = True
+        return mem.get_all(filters={"user_id": user_id}, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -164,17 +215,11 @@ async def get_all_memories(user_id: str, limit: int | None = None) -> list[dict]
     Pass None (default) to fetch all (fine for occasional housekeeping;
     avoid on hot paths).
     """
-    # First init does a synchronous ChromaDB heartbeat + Memory.from_config,
-    # so don't call it directly from the event loop (can stall it for
-    # several seconds).
     mem = await asyncio.to_thread(_get_mem0)
     if not mem:
         return []
     try:
-        kwargs: dict = {"user_id": user_id}
-        if limit is not None:
-            kwargs["limit"] = limit
-        raw = await asyncio.to_thread(mem.get_all, **kwargs)
+        raw = await asyncio.to_thread(mem_get_all, mem, user_id=user_id, limit=limit)
         return raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
     except Exception as exc:
         log.warning("mem0 get_all error: %s", exc)

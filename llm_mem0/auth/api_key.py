@@ -18,14 +18,17 @@ from __future__ import annotations
 import logging
 import os
 
+from ..settings import DEFAULT_HELPER_MODEL, settings
 from .base import AuthBackend
 
 log = logging.getLogger(__name__)
 
 _DEFAULT_MODELS = {
-    "anthropic": "claude-haiku-4-5-20251001",
+    "anthropic": DEFAULT_HELPER_MODEL,
     "openai": "gpt-5-mini",
 }
+
+_KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
 
 
 class ApiKeyAuth(AuthBackend):
@@ -40,9 +43,8 @@ class ApiKeyAuth(AuthBackend):
 
     @staticmethod
     def _detect_provider() -> str | None:
-        configured = os.environ.get("MEM0_LLM_PROVIDER")
-        if configured:
-            return configured
+        if settings.MEM0_LLM_PROVIDER:
+            return settings.MEM0_LLM_PROVIDER
         if os.environ.get("ANTHROPIC_API_KEY"):
             return "anthropic"
         if os.environ.get("OPENAI_API_KEY"):
@@ -50,32 +52,53 @@ class ApiKeyAuth(AuthBackend):
         return None
 
     def default_model(self) -> str:
-        return _DEFAULT_MODELS.get(self.provider, os.environ.get("MEM0_LLM_MODEL", ""))
+        return _DEFAULT_MODELS.get(self.provider, settings.MEM0_LLM_MODEL)
 
     def mem0_llm_config(self, *, model: str) -> dict:
         config: dict = {"model": model, "temperature": 0.1, "max_tokens": 2000}
-        key_env = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}.get(self.provider)
-        if key_env and os.environ.get(key_env):
-            config["api_key"] = os.environ[key_env]
+        key = self._api_key()
+        if key:
+            config["api_key"] = key
         return {"provider": self.provider, "config": config}
+
+    def _api_key(self) -> str | None:
+        key_env = _KEY_ENV.get(self.provider)
+        return os.environ.get(key_env) if key_env else None
 
     def _get_client(self):
         if self._client is not None:
             return self._client
-        if self.provider == "anthropic":
-            from anthropic import AsyncAnthropic
-            self._client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-        elif self.provider == "openai":
-            from openai import AsyncOpenAI
-            self._client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
-        else:
+        if self.provider not in _KEY_ENV:
             raise RuntimeError(
                 f"llm_mem0's direct helper calls (classification/extraction) only "
                 f"support provider='anthropic' or 'openai' natively; "
                 f"provider={self.provider!r} can still be used for mem0's own "
                 f"internal Memory.add()/search() calls via mem0_llm_config()."
             )
+        key = self._api_key()
+        if not key:
+            # MEM0_LLM_PROVIDER can select a provider whose key env var is
+            # unset; fail with a clear message instead of a raw KeyError.
+            raise RuntimeError(
+                f"provider={self.provider!r} selected but "
+                f"{_KEY_ENV[self.provider]} is not set"
+            )
+        if self.provider == "anthropic":
+            from anthropic import AsyncAnthropic
+            self._client = AsyncAnthropic(api_key=key)
+        else:
+            from openai import AsyncOpenAI
+            self._client = AsyncOpenAI(api_key=key)
         return self._client
+
+    async def aclose(self) -> None:
+        """Close the cached async client (if any)."""
+        client, self._client = self._client, None
+        if client is not None:
+            try:
+                await client.close()
+            except Exception as exc:
+                log.debug("ApiKeyAuth.aclose: %s", exc)
 
     async def complete(self, *, system: str, user_message: str, model: str, max_tokens: int) -> str:
         try:

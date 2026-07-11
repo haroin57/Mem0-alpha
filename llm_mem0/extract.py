@@ -1,18 +1,16 @@
 """LLM-based fact extraction & metadata classification for ingestion."""
 
+from __future__ import annotations
+
+import json
 import logging
-import os
 import re
 
 from .auth import get_auth_backend
-from .format import strip_json_fence
+from .llm import complete_json, escape_braces, strip_json_fence
+from .settings import settings
 
 log = logging.getLogger(__name__)
-
-MEM0_CLASSIFY_MODEL = os.environ.get("MEM0_CLASSIFY_MODEL", "claude-haiku-4-5-20251001")
-MEM0_GATE_MODEL = os.environ.get("MEM0_GATE_MODEL", "claude-haiku-4-5-20251001")
-MEM0_EXTRACT_MAX_TOKENS = int(os.environ.get("MEM0_EXTRACT_MAX_TOKENS", "2000"))
-MEM0_EXTRACT_INPUT_CHARS = int(os.environ.get("MEM0_EXTRACT_INPUT_CHARS", "2000"))
 
 
 def _salvage_json_objects(text: str, array_key: str) -> list[dict]:
@@ -28,7 +26,6 @@ def _salvage_json_objects(text: str, array_key: str) -> list[dict]:
     """
     if not text:
         return []
-    import json as _json
     m = re.search(r'"' + re.escape(array_key) + r'"\s*:\s*\[', text)
     if not m:
         return []
@@ -57,10 +54,10 @@ def _salvage_json_objects(text: str, array_key: str) -> list[dict]:
             depth -= 1
             if depth == 0 and start is not None:
                 try:
-                    obj = _json.loads(text[start:i + 1])
+                    obj = json.loads(text[start:i + 1])
                     if isinstance(obj, dict):
                         objs.append(obj)
-                except _json.JSONDecodeError:
+                except json.JSONDecodeError:
                     pass
                 start = None
         elif ch == "]" and depth == 0:
@@ -110,48 +107,37 @@ async def _classify_for_metadata(messages: list[dict]) -> dict:
 
     Returns empty dict on any failure — callers must treat it as best-effort.
     """
-    try:
-        backend = get_auth_backend()
-        conv_parts = []
-        for m in messages or []:
-            role = m.get("role", "?")
-            content = m.get("content", "")
-            if not isinstance(content, str):
-                content = str(content)
-            if content:
-                # strip XML breakout tags and escape braces before format()
-                safe_content = _strip_extract_breakout_tags(content[:400])
-                safe_content = safe_content.replace("{", "{{").replace("}", "}}")
-                conv_parts.append(f"{role}: {safe_content}")
-        if not conv_parts:
-            return {}
-        conv = "\n".join(conv_parts)
-        text = (await backend.complete(
-            system=(
-                "You classify long-term memory entries into "
-                "category/subcategory/importance/tier/tags. Return JSON only."
-            ),
-            user_message=_CLASSIFY_PROMPT.format(conv=conv),
-            model=MEM0_CLASSIFY_MODEL,
-            max_tokens=2000,
-        )).strip()
-        # strip codeblock if any
-        if text.startswith("```"):
-            text = text.split("```", 2)[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.rsplit("```", 1)[0].strip()
-        import json as _json
-        meta = _json.loads(text)
-        # keep only the keys we care about
-        return {
-            k: meta[k]
-            for k in ("category", "subcategory", "importance", "tier", "tags")
-            if k in meta
-        }
-    except Exception as exc:
-        log.warning("classify_for_metadata failed: %s", exc)
+    conv_parts = []
+    for m in messages or []:
+        role = m.get("role", "?")
+        content = m.get("content", "")
+        if not isinstance(content, str):
+            content = str(content)
+        if content:
+            # strip XML breakout tags and escape braces before format()
+            safe_content = escape_braces(
+                _strip_extract_breakout_tags(content[:400]))
+            conv_parts.append(f"{role}: {safe_content}")
+    if not conv_parts:
         return {}
+    meta = await complete_json(
+        system=(
+            "You classify long-term memory entries into "
+            "category/subcategory/importance/tier/tags. Return JSON only."
+        ),
+        user_message=_CLASSIFY_PROMPT.format(conv="\n".join(conv_parts)),
+        model=settings.MEM0_CLASSIFY_MODEL,
+        max_tokens=2000,
+        caller="extract.classify_for_metadata",
+    )
+    if not isinstance(meta, dict):
+        return {}
+    # keep only the keys we care about
+    return {
+        k: meta[k]
+        for k in ("category", "subcategory", "importance", "tier", "tags")
+        if k in meta
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -180,8 +166,7 @@ def _strip_extract_breakout_tags(s: str) -> str:
     out = s
     for tag in _EXTRACT_XML_BREAKOUT_TAGS:
         # Case-insensitive replace via re for robustness
-        import re as _re
-        out = _re.sub(_re.escape(tag), "", out, flags=_re.IGNORECASE)
+        out = re.sub(re.escape(tag), "", out, flags=re.IGNORECASE)
     return out
 
 
@@ -475,13 +460,13 @@ async def extract_full_signals(
         "loves", "dislikes", "knows", "works_at", "lives_in",
         "made_by", "is_about", "friend_of", "parent_of", "sibling_of",
     }
-    import json as _json
     try:
         backend = get_auth_backend()
         known_entities_body = _format_known_entities(user_id)
         user_message = _EXTRACT_PROMPT.format(
             context_hint=_strip_extract_breakout_tags(context_hint or "(none)")[:1000],
-            user_text=_strip_extract_breakout_tags(user_text or "")[:MEM0_EXTRACT_INPUT_CHARS],
+            user_text=_strip_extract_breakout_tags(
+                user_text or "")[:settings.MEM0_EXTRACT_INPUT_CHARS],
             assistant_text=_strip_extract_breakout_tags(assistant_text or "")[:2000],
             known_entities=known_entities_body,
             alias_resolution=_format_alias_resolution(user_aliases),
@@ -502,8 +487,8 @@ async def extract_full_signals(
             text = strip_json_fence(await backend.complete(
                 system=task_prompt,
                 user_message=user_message,
-                model=MEM0_GATE_MODEL,
-                max_tokens=MEM0_EXTRACT_MAX_TOKENS,
+                model=settings.MEM0_GATE_MODEL,
+                max_tokens=settings.MEM0_EXTRACT_MAX_TOKENS,
             ))
             if not text:
                 log.warning(
@@ -512,9 +497,9 @@ async def extract_full_signals(
                 )
                 continue  # retry on an empty response
             try:
-                data = _json.loads(text)
+                data = json.loads(text)
                 break  # clean parse — done
-            except _json.JSONDecodeError as exc:
+            except json.JSONDecodeError as exc:
                 salvaged = _salvage_facts(text)
                 if salvaged["facts"]:
                     log.warning(

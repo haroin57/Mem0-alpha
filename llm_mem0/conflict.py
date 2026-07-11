@@ -26,8 +26,9 @@ costs us a real fact.
 from __future__ import annotations
 
 import logging
-from .format import strip_json_fence
-import os
+
+from .llm import complete_json, escape_braces
+from .settings import settings
 
 log = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ VALID_CONFLICT_TYPES = ("update", "correction", "addition", "none")
 
 
 async def classify_conflict(existing_text: str, candidate_text: str) -> dict:
-    """Ask Haiku how the candidate relates to the existing fact.
+    """Ask the helper model how the candidate relates to the existing fact.
 
     Returns ``{"conflict_type": <one of VALID_CONFLICT_TYPES>, "reason": str}``.
     On any failure the result is ``{"conflict_type": "addition", "reason":
@@ -62,31 +63,22 @@ async def classify_conflict(existing_text: str, candidate_text: str) -> dict:
     """
     if not existing_text or not candidate_text:
         return {"conflict_type": "addition", "reason": "empty-input"}
-    try:
-        from .auth import get_auth_backend
-        backend = get_auth_backend()
-        safe_existing = existing_text[:300].replace("{", "{{").replace("}", "}}")
-        safe_candidate = candidate_text[:300].replace("{", "{{").replace("}", "}}")
-        text = strip_json_fence(await backend.complete(
-            system=(
-                "You classify whether a new fact contradicts, updates, or "
-                "complements an existing fact. Return JSON only."
-            ),
-            user_message=_CONFLICT_PROMPT.format(
-                existing=safe_existing, candidate=safe_candidate,
-            ),
-            model=os.environ.get("MEM0_CONFLICT_MODEL", "claude-haiku-4-5-20251001"),
-            max_tokens=int(os.environ.get("MEM0_CONFLICT_MAX_TOKENS", "300")),
-        ))
-        if not text:
-            return {"conflict_type": "addition", "reason": "no-client"}
-        import json as _json
-        data = _json.loads(text)
-        ctype = data.get("conflict_type", "addition")
-        if ctype not in VALID_CONFLICT_TYPES:
-            return {"conflict_type": "addition", "reason": f"unknown-type:{ctype}"}
-        reason = str(data.get("reason", ""))[:80]
-        return {"conflict_type": ctype, "reason": reason}
-    except Exception as exc:
-        log.warning("classify_conflict failed (fail-open): %s", exc)
+    data = await complete_json(
+        system=(
+            "You classify whether a new fact contradicts, updates, or "
+            "complements an existing fact. Return JSON only."
+        ),
+        user_message=_CONFLICT_PROMPT.format(
+            existing=escape_braces(existing_text, limit=300),
+            candidate=escape_braces(candidate_text, limit=300),
+        ),
+        model=settings.MEM0_CONFLICT_MODEL,
+        max_tokens=settings.MEM0_CONFLICT_MAX_TOKENS,
+        caller="conflict.classify_conflict",
+    )
+    if not isinstance(data, dict):
         return {"conflict_type": "addition", "reason": "fail-open"}
+    ctype = data.get("conflict_type", "addition")
+    if ctype not in VALID_CONFLICT_TYPES:
+        return {"conflict_type": "addition", "reason": f"unknown-type:{ctype}"}
+    return {"conflict_type": ctype, "reason": str(data.get("reason", ""))[:80]}

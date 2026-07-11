@@ -3,6 +3,7 @@
 import re
 from datetime import datetime, timezone
 
+from .llm import strip_json_fence  # noqa: F401 — re-export (moved to llm.py)
 from .sanitize import POWER_PHRASE_RE
 
 # Markers an attacker could have stored in a fact (via the ingestion path)
@@ -158,19 +159,3 @@ def format_history_for_prompt(results: list[dict]) -> str:
         return ""
     lines.append("[End of history]")
     return "\n".join(lines)
-
-
-def strip_json_fence(text: str) -> str:
-    """Remove a Markdown ```json fence around an LLM JSON reply, if present.
-
-    LLMs asked for raw JSON wrap it in a fence often enough that nine call
-    sites across extract/search/dedup/conflict had hand-rolled this exact
-    dance (P5-b unification).
-    """
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("```", 2)[1]
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.rsplit("```", 1)[0].strip()
-    return text
