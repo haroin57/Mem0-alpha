@@ -152,6 +152,45 @@ def search_history(query: str, channel_id: int, limit: int = 5) -> list[dict]:
     return _store.read(_search, what="search_history", default=[]) or []
 
 
+def get_lines_since(channel_id: int, since_ts: str = "", limit: int = 500) -> list[dict]:
+    """Return raw conversation lines for one channel, oldest first, strictly
+    after ``since_ts`` (lexical comparison — safe because lines are indexed
+    with the ISO-8601-ish, zero-padded ``strftime`` format the JSONL writer
+    uses).
+
+    Used by ``replay.py``'s replay job to walk history in chronological
+    order without depending on the source transcript files directly — this
+    module already receives every line via ``index_line`` and the FTS5
+    table holds each line's verbatim ``orig_text``, so replay can read
+    entirely from here. Not a MATCH query (no keyword filter), so this is a
+    plain indexed scan — fine for a nightly batch job, not meant for the hot
+    search path.
+    """
+    if channel_id is None:
+        return []
+
+    def _fetch(c) -> list[dict]:
+        if since_ts:
+            rows = c.execute(
+                "SELECT ts, role, author, orig_text FROM history_fts "
+                "WHERE channel_id = ? AND ts > ? ORDER BY ts ASC LIMIT ?",
+                (str(channel_id), since_ts, max(int(limit), 1)),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT ts, role, author, orig_text FROM history_fts "
+                "WHERE channel_id = ? ORDER BY ts ASC LIMIT ?",
+                (str(channel_id), max(int(limit), 1)),
+            ).fetchall()
+        return [
+            {"ts": r["ts"], "role": r["role"], "author": r["author"],
+             "text": r["orig_text"]}
+            for r in rows
+        ]
+
+    return _store.read(_fetch, what="get_lines_since", default=[]) or []
+
+
 def reindex_all(lines: Iterable[tuple[int, str, str, str, str]]) -> int:
     """Wipe-and-rebuild the index from an iterable of
     (channel_id, ts, role, text, author).

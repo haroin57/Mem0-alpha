@@ -48,3 +48,24 @@ class AuthBackend(ABC):
         down event loops should call :func:`llm_mem0.auth.aclose_auth_backend`
         (which delegates here) to avoid unclosed-session warnings.
         """
+
+    def provider_id(self) -> str:
+        """Identity used for provider-drift detection.
+
+        ``client._get_mem0`` rebuilds its cached ``mem0.Memory`` instance
+        when this value changes between calls — a backend whose effective
+        provider can shift at runtime (e.g. OAuth session lost → API-key
+        fallback chain) should return the *currently desired* provider here
+        so the memory store's internal LLM follows the switch. The default
+        is static (per-class), which never triggers a rebuild.
+        """
+        return type(self).__name__
+
+    def refresh_memory_llm(self, memory) -> None:
+        """Hook: sync a rotated credential onto mem0's internal LLM client.
+
+        Called (synchronously, best-effort) by ``client._get_mem0`` every
+        time the cached instance is handed out. Backends whose tokens rotate
+        mid-process (OAuth) should re-point ``memory.llm.client`` auth here;
+        the default is a no-op for static API keys.
+        """

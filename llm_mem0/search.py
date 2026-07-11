@@ -642,6 +642,125 @@ async def get_core_memories(
         return []
 
 
+# ---------------------------------------------------------------------------
+# Feeling-of-knowing gate (Phase ⑦)
+# ---------------------------------------------------------------------------
+def assess_recall_confidence(candidates: list[dict]) -> dict:
+    """Feeling-of-knowing gate: a calibrated "do we actually know this?"
+    judgment, computed independently of what an LLM rerank subsequently
+    chooses to keep.
+
+    Human metamemory can report "I don't know" before (or instead of)
+    attempting full retrieval (Hart 1965's original FOK paradigm) — a
+    judgment distinct from whatever a retrieval attempt itself returns.
+    Without it, ``_rerank_memories`` always returns up to ``top_k`` items
+    when ``len(candidates) <= top_k`` (its fallback branch), even when
+    every candidate is cosine-distant noise, and nothing downstream
+    distinguishes "checked thoroughly, nothing relevant" from "found
+    something" — an absent/empty fact block reads to the model as "memory
+    wasn't consulted", not as a calibrated null result, which invites
+    confabulation.
+
+    Uses the candidate pool's best RAW cosine distance (before rerank/boost
+    can pull scores around) as the primary signal, since it reflects how
+    close the SINGLE closest thing in the entire expanded-query,
+    hybrid-retrieved, graph-expanded candidate pool is — the most
+    permissive evidence this library can produce for a query. Purely
+    advisory: does not mutate ``candidates``; callers decide what to do
+    with the status (see ``search_memories_smart``'s ``MEM0_FOK_ENABLED``
+    gate for the one built-in consumer).
+
+    Thresholds: NO_MEMORY (default 1.1) sits just under the plain-path
+    relevance gate (1.2) so it only fires when nothing in the pool cleared
+    even that bar; WEAK (0.75) marks the tangentially-related zone.
+
+    Returns ``{"status": "confident"|"weak"|"no_memory", "best_distance":
+    float|None, "candidate_count": int}``.
+    """
+    distances = [
+        c.get("score") for c in candidates
+        if isinstance(c.get("score"), (int, float))
+    ]
+    best_distance = min(distances) if distances else None
+    if best_distance is None or best_distance >= settings.MEM0_FOK_NO_MEMORY_DISTANCE:
+        status = "no_memory"
+    elif best_distance >= settings.MEM0_FOK_WEAK_DISTANCE:
+        status = "weak"
+    else:
+        status = "confident"
+    return {
+        "status": status,
+        "best_distance": best_distance,
+        "candidate_count": len(candidates),
+    }
+
+
+def _fire_recall_reinforcement(results: list[dict]) -> None:
+    """Phase ①: testing-effect reinforcement for facts actually surfaced by
+    search — as opposed to reinforce_existing (reinforce.py), which only
+    fires on an ingest-time near-dup hit.
+
+    Core memories (``_core=True``, injected unconditionally every turn
+    regardless of query) are excluded: they carry no information about
+    whether *this* fact was relevant to *this* query, so reinforcing them
+    here would just be a disguised per-turn counter, not a retrieval
+    signal. Episode-bundle siblings (``_episode_bundle=True``) are excluded
+    for the same reason — they ride along on the top hit's coattails rather
+    than being independently retrieved.
+
+    Fire-and-forget: spawned as a background task so a slow/failed metadata
+    write never adds latency to the search request that triggered it.
+    Losing a handful of these on process shutdown is an accepted tradeoff
+    (see MEM0_RECALL_REINFORCE_MIN_INTERVAL_SEC).
+    """
+    if not settings.MEM0_RECALL_REINFORCE_ENABLED or not results:
+        return
+    ids = [
+        r.get("id") for r in results
+        if r.get("id") and not r.get("_core") and not r.get("_episode_bundle")
+    ]
+    if not ids:
+        return
+
+    async def _do():
+        try:
+            from .reinforce import reinforce_on_recall
+            mem = await asyncio.to_thread(_get_mem0)
+            if not mem:
+                return
+            await asyncio.gather(
+                *(reinforce_on_recall(mem, mid) for mid in ids),
+                return_exceptions=True,
+            )
+        except Exception as exc:
+            log.warning("recall reinforcement batch failed (non-fatal): %s", exc)
+
+    try:
+        asyncio.get_running_loop()
+        asyncio.create_task(_do())
+    except RuntimeError:
+        pass  # no running loop (e.g. called from sync test code) — skip
+
+
+async def _finalize_smart_result(
+    query_results: list[dict], core_task, limit: int,
+    confidence: dict, *, fok_block: bool,
+) -> list[dict]:
+    """Merge core memories in (unconditionally — they don't depend on this
+    query's recall confidence) and, when the FOK gate fired, append the
+    explicit no-relevant-memory sentinel that
+    ``format.format_memories_for_prompt`` renders as a calibrated null
+    result rather than a silently absent block."""
+    core = await core_task if core_task is not None else []
+    merged = _merge_core_first(core, query_results, limit)
+    if fok_block:
+        merged = list(merged) + [{
+            "_fok_no_memory": True,
+            "best_distance": confidence.get("best_distance"),
+        }]
+    return merged
+
+
 def _merge_core_first(
     core: list[dict], results: list[dict], limit: int,
 ) -> list[dict]:
@@ -812,16 +931,41 @@ async def search_memories_smart(
         current_channel_id=current_channel_id,
     )
 
-    # Graph expansion (Obsidian-style 1-hop): for each top-3 candidate,
-    # look up its linked entities and surface sibling facts that share an
-    # entity. This rescues facts that share an entity with the user's
-    # intent but didn't make the cosine cut. Non-fatal on failure.
+    # Graph expansion (spreading activation): rescue facts that share an
+    # entity with the user's intent but didn't make the cosine cut.
+    # Non-fatal on failure.
     try:
         candidates = await _graph_expand_candidates(
             candidates, user_id, current_channel_id=current_channel_id,
         )
     except Exception as exc:
         log.warning("graph_expand failed (non-fatal): %s", exc)
+
+    # Phase ⑦: compute feeling-of-knowing BEFORE rerank/boost touch scores,
+    # so it reflects the raw candidate pool's best evidence, not an LLM's
+    # post-hoc pick from a uniformly bad lot. Logged unconditionally (cheap,
+    # one line) so a corpus of [FOK ...] log lines exists to calibrate the
+    # thresholds against real query outcomes before the gate is flipped on.
+    confidence = assess_recall_confidence(candidates)
+    log.info(
+        "[FOK query_len=%d status=%s best_distance=%s candidates=%d]",
+        len(query or ""), confidence["status"],
+        "none" if confidence["best_distance"] is None else f'{confidence["best_distance"]:.3f}',
+        confidence["candidate_count"],
+    )
+    fok_block = settings.MEM0_FOK_ENABLED and confidence["status"] == "no_memory"
+
+    if fok_block:
+        # Nothing in the whole candidate pool cleared even the loose
+        # relevance bar — skip the rerank LLM call entirely (it would only
+        # be picking a "least bad" option from noise) and return a
+        # calibrated null result instead.
+        log.info(
+            "[FOK_GATE query_len=%d best_distance=%s] no_memory — skipping rerank/plain search",
+            len(query or ""),
+            "none" if confidence["best_distance"] is None else f'{confidence["best_distance"]:.3f}',
+        )
+        return await _finalize_smart_result([], core_task, limit, confidence, fok_block=True)
 
     if rerank:
         # LLM rerank already judged per-fact relevance against the query.
@@ -836,9 +980,9 @@ async def search_memories_smart(
         _log_smart_metrics(
             query, candidates, len(reranked), bundle_added, rerank=True,
         )
-        if core_task is not None:
-            reranked = _merge_core_first(await core_task, reranked, limit)
-        return reranked
+        _fire_recall_reinforcement(reranked)
+        return await _finalize_smart_result(
+            reranked, core_task, limit, confidence, fok_block=False)
 
     # Per-user recency/engagement ordering on the plain path too (no LLM).
     # Re-sorts candidates by boosted distance so well-reinforced facts win
@@ -852,79 +996,161 @@ async def search_memories_smart(
         or r.get("score", 0) <= max_distance
     ]
     _log_smart_metrics(query, candidates, len(filtered), 0, rerank=False)
-    if core_task is not None:
-        filtered = _merge_core_first(await core_task, filtered, limit)
-    return filtered
+    _fire_recall_reinforcement(filtered)
+    return await _finalize_smart_result(
+        filtered, core_task, limit, confidence, fok_block=False)
 
 
 async def _graph_expand_candidates(
-    candidates: list[dict], user_id: str, *, top_seed: int = 3, per_entity: int = 3,
+    candidates: list[dict], user_id: str, *, top_seed: int = 3, per_entity: int = 5,
     current_channel_id: str | None = None,
 ) -> list[dict]:
-    """1-hop graph expansion via the graph module.
+    """Multi-hop spreading-activation graph expansion (Phase ④).
 
-    For each of the top ``top_seed`` candidates, fetch the entities linked
-    to it, then for each entity fetch up to ``per_entity`` sibling fact
-    ids. Sibling facts are pulled from ChromaDB via mem.get() and merged
-    into the candidate list (deduped by fact id). Boost-prone fields like
-    score are left untouched — the LLM rerank decides ordering downstream.
+    Seeds activation from the top ``top_seed`` cosine candidates
+    (activation = 1 - distance, so a closer hit seeds more strongly), then
+    propagates through co-occurrence-weighted entity edges
+    (``graph.get_co_occurring_entities``) for up to
+    ``MEM0_GRAPH_SPREAD_MAX_HOPS`` hops, multiplying by
+    ``MEM0_GRAPH_SPREAD_DECAY_GAMMA`` at each hop. This mirrors spreading
+    activation in semantic-network models of human memory: activation
+    weakens with graph distance from the retrieval cue, rather than the
+    previous behavior (a flat 1-hop expansion where every sibling got an
+    identical score regardless of how strongly — or weakly — connected it
+    was to the query).
+
+    Session priming (``priming.get_primed_entities``) adds a flat activation
+    top-up for entities touched recently in this (user, channel) — an
+    encoding-specificity effect independent of any stored graph edge. The
+    entities seeding THIS expansion are then themselves recorded via
+    ``priming.touch``, so a topic raised via search can prime a
+    closely-following turn even before enough mentions accumulate to form a
+    real co-occurrence edge.
+
+    Sibling facts are scored by their accumulated activation
+    (``distance = BASE - WEIGHT * activation``, floored) instead of a flat
+    constant, so a strongly, closely connected fact outranks a weakly or
+    distantly connected one, and both stay behind genuine high-cosine hits
+    by construction (BASE exceeds a typical real hit's distance).
     """
     if not candidates:
         return candidates
-    from . import graph
+    from . import graph, priming
     # 初回 init の ChromaDB heartbeat (同期 requests) でループを止めない。
     mem = await asyncio.to_thread(_get_mem0)
     if mem is None:
         return candidates
 
+    max_hops = settings.MEM0_GRAPH_SPREAD_MAX_HOPS
+    decay_gamma = settings.MEM0_GRAPH_SPREAD_DECAY_GAMMA
+    min_activation = settings.MEM0_GRAPH_SPREAD_MIN_ACTIVATION
+
     seen_ids = {c.get("id") for c in candidates if c.get("id")}
-    sibling_ids: list[str] = []
+
+    # --- seed activation from the top cosine candidates -----------------
+    frontier: dict[int, float] = {}
     for c in candidates[:top_seed]:
         fid = c.get("id")
         if not fid:
             continue
+        score = c.get("score")
+        seed_act = 1.0 - min(score, 1.0) if isinstance(score, (int, float)) else 0.5
+        seed_act = max(seed_act, 0.1)
         try:
             entities = await asyncio.to_thread(graph.get_fact_entities, fid)
         except Exception:
             continue
         for e in entities:
+            if seed_act > frontier.get(e.id, 0.0):
+                frontier[e.id] = seed_act
+
+    if not frontier:
+        return candidates
+    seed_entity_ids = list(frontier.keys())
+
+    # --- propagate for up to max_hops, decaying by gamma each hop -------
+    entity_activation: dict[int, float] = {}
+    for _hop in range(max_hops):
+        next_frontier: dict[int, float] = {}
+        for eid, act in frontier.items():
+            entity_activation[eid] = max(act, entity_activation.get(eid, 0.0))
             try:
-                related = await asyncio.to_thread(
-                    graph.get_related_facts, e.id, limit=per_entity,
-                    exclude_fact_ids=list(seen_ids),
+                neighbors = await asyncio.to_thread(
+                    graph.get_co_occurring_entities, eid, limit=per_entity,
                 )
             except Exception:
                 continue
-            for r in related:
-                if r not in seen_ids:
-                    seen_ids.add(r)
-                    sibling_ids.append(r)
+            for other_id, weight in neighbors:
+                propagated = act * weight * decay_gamma
+                if propagated < min_activation:
+                    continue
+                if propagated > max(
+                    entity_activation.get(other_id, 0.0), next_frontier.get(other_id, 0.0),
+                ):
+                    next_frontier[other_id] = propagated
+        if not next_frontier:
+            break
+        frontier = next_frontier
 
-    if not sibling_ids:
+    if not entity_activation:
         return candidates
 
-    # Fetch sibling facts from ChromaDB and merge.
-    siblings: list[dict] = []
-    for fid in sibling_ids:
+    # Session priming top-up + re-priming from this expansion's seeds.
+    try:
+        primed = priming.get_primed_entities(user_id, current_channel_id)
+        bonus = settings.MEM0_PRIMING_ACTIVATION_BONUS
+        for eid in primed:
+            entity_activation[eid] = entity_activation.get(eid, 0.0) + bonus
+        priming.touch(user_id, current_channel_id, seed_entity_ids)
+    except Exception as exc:
+        log.warning("priming buffer failed (non-fatal): %s", exc)
+
+    # --- pull sibling facts for every activated entity -------------------
+    fact_best_activation: dict[str, float] = {}
+    for eid, act in entity_activation.items():
         try:
-            fact = await asyncio.to_thread(mem.get, fid)
-            # Phase R: graph 経由の sibling は search_memories の validity
-            # フィルタを通らないので、archived / 他会話 scope をここで落とす。
-            if (
-                isinstance(fact, dict) and fact.get("memory")
-                and _is_fact_valid(fact, current_channel_id)
-            ):
-                # Sibling facts pulled by graph expansion don't carry a
-                # cosine score. Assign a neutral mid-range distance so they
-                # don't crowd out actual top-cosine matches but still get
-                # surfaced to the LLM rerank for the final call.
-                if fact.get("score") is None:
-                    fact["score"] = 0.8
-                fact["_graph_expanded"] = True
-                siblings.append(fact)
+            related = await asyncio.to_thread(
+                graph.get_related_facts, eid, limit=per_entity,
+                exclude_fact_ids=list(seen_ids),
+            )
         except Exception:
             continue
+        for fid in related:
+            if fid in seen_ids:
+                continue
+            if act > fact_best_activation.get(fid, 0.0):
+                fact_best_activation[fid] = act
+
+    if not fact_best_activation:
+        return candidates
+
+    base_distance = settings.MEM0_GRAPH_SIBLING_BASE_DISTANCE
+    activation_weight = settings.MEM0_GRAPH_SIBLING_ACTIVATION_WEIGHT
+    min_distance = settings.MEM0_GRAPH_SIBLING_MIN_DISTANCE
+    siblings: list[dict] = []
+    for fid, act in fact_best_activation.items():
+        try:
+            fact = await asyncio.to_thread(mem.get, fid)
+        except Exception:
+            continue
+        # Phase R: graph 経由の sibling は search_memories の validity
+        # フィルタを通らないので、archived / 他会話 scope をここで落とす。
+        if not (
+            isinstance(fact, dict) and fact.get("memory")
+            and _is_fact_valid(fact, current_channel_id)
+        ):
+            continue
+        fact["score"] = max(min_distance, base_distance - activation_weight * act)
+        fact["_graph_expanded"] = True
+        fact["_graph_activation"] = act
+        siblings.append(fact)
+        seen_ids.add(fid)
+
     if siblings:
-        log.info("graph_expand: added %d sibling facts via 1-hop", len(siblings))
+        log.info(
+            "graph_expand: added %d sibling facts via spreading activation "
+            "(max_hops=%d, entities_activated=%d)",
+            len(siblings), max_hops, len(entity_activation),
+        )
         candidates = candidates + siblings
     return candidates

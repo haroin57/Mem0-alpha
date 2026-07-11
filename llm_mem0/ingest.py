@@ -43,6 +43,9 @@ _INSERT_SEEN_MAX = 8000
 _ALLOWED_CALLER_META = {
     "channel_id", "channel_name", "source",
     "persona", "episode_id", "interest_tags",
+    # replay/schema-abstraction provenance: comma-joined instance fact ids
+    # a consolidation-derived fact was generalized from (see replay.py).
+    "derived_from",
 }
 
 _EMPTY_SKIPPED = {"low_importance": 0, "other_speaker": 0, "near_dup": 0}
@@ -531,6 +534,7 @@ async def _index_side_stores(
         entities = f.get("entities") or []
         if entities:
             from . import graph
+            linked_eids: list[int] = []
             for ent in entities:
                 if not isinstance(ent, dict):
                     continue
@@ -544,8 +548,17 @@ async def _index_side_stores(
                     aliases=ent.get("aliases") or [],
                 )
                 if eid:
+                    linked_eids.append(eid)
                     for fid in fact_ids:
                         await asyncio.to_thread(graph.add_edge, fid, eid)
+            # Phase ④: entities just mentioned prime this session's next
+            # search (see priming.py) — ingest and search share the same
+            # buffer so either side of a turn can prime the other.
+            if linked_eids:
+                from . import priming
+                priming.touch(
+                    str(user_id), base_meta.get("channel_id"), linked_eids,
+                )
     except Exception as e:
         log.warning("graph update failed (non-fatal): %s", e)
 

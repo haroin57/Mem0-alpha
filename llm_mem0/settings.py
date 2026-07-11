@@ -105,6 +105,61 @@ _SPECS: dict[str, _Spec] = {
     # Reinforcement boost age-decay component.
     "MEM0_BOOST_ALPHA_AGE": _Spec(0.03, float),
     "MEM0_BOOST_AGE_HALF_LIFE_DAYS": _Spec(90.0, float),
+    # Boost formula: "legacy" (hand-tuned freq+recency+age) or "actr"
+    # (power-law base-level activation). legacy stays the default until the
+    # ACT-R mode has been A/B compared in production.
+    "MEM0_BOOST_MODE": _Spec("legacy", str),
+    # ACT-R base-level activation knobs (MEM0_BOOST_MODE=actr).
+    "MEM0_ACTR_DECAY_D": _Spec(0.5, float),
+    "MEM0_ACTR_BOOST_ALPHA": _Spec(0.2, float),
+    "MEM0_ACTR_RETRIEVAL_THRESHOLD": _Spec(-7.5, float),
+    "MEM0_ACTR_NOISE_S": _Spec(1.0, float),
+    # Recall-time (testing effect) reinforcement: fires when a fact is
+    # surfaced by smart search; rate-limited per fact (spacing effect).
+    "MEM0_RECALL_REINFORCE_ENABLED": _Spec(False, _parse_bool),
+    "MEM0_RECALL_REINFORCE_MIN_INTERVAL_SEC": _Spec(6 * 3600, int),
+    # Phase ④: spreading-activation graph expansion (Collins & Loftus-style
+    # activation decaying with graph distance; see search._graph_expand_candidates).
+    "MEM0_GRAPH_SPREAD_MAX_HOPS": _Spec(2, int),
+    "MEM0_GRAPH_SPREAD_DECAY_GAMMA": _Spec(0.5, float),
+    "MEM0_GRAPH_SPREAD_MIN_ACTIVATION": _Spec(0.05, float),
+    # Sibling distance = BASE - WEIGHT * activation, floored at MIN. BASE
+    # stays above a typical real cosine hit's distance so graph-expanded
+    # facts never systematically outrank genuine vector/BM25 matches.
+    "MEM0_GRAPH_SIBLING_BASE_DISTANCE": _Spec(0.9, float),
+    "MEM0_GRAPH_SIBLING_ACTIVATION_WEIGHT": _Spec(0.4, float),
+    "MEM0_GRAPH_SIBLING_MIN_DISTANCE": _Spec(0.3, float),
+    # Session priming buffer (priming.py): flat activation top-up for
+    # entities touched recently in this (user, channel).
+    "MEM0_PRIMING_ACTIVATION_BONUS": _Spec(0.1, float),
+    "MEM0_PRIMING_TTL_SEC": _Spec(30 * 60, int),
+    "MEM0_PRIMING_MAX_ENTITIES": _Spec(20, int),
+    # Phase ⑦: feeling-of-knowing gate. When enabled and the whole candidate
+    # pool's best RAW cosine distance exceeds NO_MEMORY, smart search skips
+    # the rerank LLM call and returns a calibrated null-result sentinel
+    # instead (rendered by format_memories_for_prompt). Thresholds are on
+    # raw distance, same units as MEM0_RELEVANCE_MAX_DISTANCE.
+    "MEM0_FOK_ENABLED": _Spec(False, _parse_bool),
+    "MEM0_FOK_NO_MEMORY_DISTANCE": _Spec(1.1, float),
+    "MEM0_FOK_WEAK_DISTANCE": _Spec(0.75, float),
+
+    # --- Phase ② forgetting (decay.py) ---------------------------------------
+    # Tier thresholds in ACT-R activation units, calibrated against the
+    # single-presentation decay curve (see decay.py module docstring).
+    "MEM0_TIER_LIVE_ACTIVATION": _Spec(-6.0, float),
+    "MEM0_TIER_HOT_ACTIVATION": _Spec(-7.5, float),
+    "MEM0_TIER_WARM_ACTIVATION": _Spec(-8.7, float),
+    "MEM0_GIST_MIN_CLUSTER_SIZE": _Spec(3, int),
+    # Facts above this importance are exempt from gist compression.
+    "MEM0_GIST_MAX_IMPORTANCE": _Spec(3, int),
+    "MEM0_GIST_MAX_CLUSTERS_PER_RUN": _Spec(20, int),
+
+    # --- Phase ③ systems consolidation (replay.py) ---------------------------
+    "MEM0_REPLAY_MAX_TURNS_PER_RUN": _Spec(50, int),
+    "MEM0_SCHEMA_MIN_DISTINCT_ENTITIES": _Spec(3, int),
+    "MEM0_SCHEMA_MAX_GROUPS_PER_RUN": _Spec(10, int),
+    "MEM0_SCHEMA_MODEL": _Spec(DEFAULT_HELPER_MODEL, str),
+    "MEM0_SCHEMA_MAX_TOKENS": _Spec(500, int),
     # History embedding: semantic recall over the raw transcript, in a
     # separate Chroma collection. Off by default — each line costs one
     # embedding call.
@@ -153,6 +208,17 @@ _SPECS: dict[str, _Spec] = {
     # --- Batched ingestion ----------------------------------------------------
     "MEM0_BATCH_SIZE": _Spec(10, int),
     "MEM0_BATCH_TURN_CHARS": _Spec(600, int),
+
+    # --- Prompt-block framing (format.py) ------------------------------------
+    # The header/legend/footer lines wrapping the memories block. Hosts with
+    # an existing prompt scaffold that anchors on specific marker strings
+    # (and mirrors them in their injection-defense sentinels) can override
+    # these to keep prompt bytes identical across a migration.
+    "MEM0_FORMAT_HEADER": _Spec("[Long-term memory — facts about this user]", str),
+    "MEM0_FORMAT_LEGEND": _Spec(
+        "(legend: imp=importance 1-5 / Live>Hot>Warm>Cold=freshness tier / "
+        "[date]=last confirmed / [条件: ...]=only holds under that condition)", str),
+    "MEM0_FORMAT_FOOTER": _Spec("[End of Long-term memory]", str),
 
     # --- MCP server -------------------------------------------------------------
     # Default user_id for MCP tools when the client doesn't pass one; keeps
