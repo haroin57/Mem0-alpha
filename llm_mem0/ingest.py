@@ -43,6 +43,9 @@ _INSERT_SEEN_MAX = 8000
 _ALLOWED_CALLER_META = {
     "channel_id", "channel_name", "source",
     "persona", "episode_id", "interest_tags",
+    # replay/schema-abstraction provenance: comma-joined instance fact ids
+    # a consolidation-derived fact was generalized from (see replay.py).
+    "derived_from",
 }
 
 _EMPTY_SKIPPED = {"low_importance": 0, "other_speaker": 0, "near_dup": 0}

@@ -142,6 +142,24 @@ _SPECS: dict[str, _Spec] = {
     "MEM0_FOK_ENABLED": _Spec(False, _parse_bool),
     "MEM0_FOK_NO_MEMORY_DISTANCE": _Spec(1.1, float),
     "MEM0_FOK_WEAK_DISTANCE": _Spec(0.75, float),
+
+    # --- Phase ② forgetting (decay.py) ---------------------------------------
+    # Tier thresholds in ACT-R activation units, calibrated against the
+    # single-presentation decay curve (see decay.py module docstring).
+    "MEM0_TIER_LIVE_ACTIVATION": _Spec(-6.0, float),
+    "MEM0_TIER_HOT_ACTIVATION": _Spec(-7.5, float),
+    "MEM0_TIER_WARM_ACTIVATION": _Spec(-8.7, float),
+    "MEM0_GIST_MIN_CLUSTER_SIZE": _Spec(3, int),
+    # Facts above this importance are exempt from gist compression.
+    "MEM0_GIST_MAX_IMPORTANCE": _Spec(3, int),
+    "MEM0_GIST_MAX_CLUSTERS_PER_RUN": _Spec(20, int),
+
+    # --- Phase ③ systems consolidation (replay.py) ---------------------------
+    "MEM0_REPLAY_MAX_TURNS_PER_RUN": _Spec(50, int),
+    "MEM0_SCHEMA_MIN_DISTINCT_ENTITIES": _Spec(3, int),
+    "MEM0_SCHEMA_MAX_GROUPS_PER_RUN": _Spec(10, int),
+    "MEM0_SCHEMA_MODEL": _Spec(DEFAULT_HELPER_MODEL, str),
+    "MEM0_SCHEMA_MAX_TOKENS": _Spec(500, int),
     # History embedding: semantic recall over the raw transcript, in a
     # separate Chroma collection. Off by default — each line costs one
     # embedding call.
