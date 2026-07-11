@@ -531,6 +531,7 @@ async def _index_side_stores(
         entities = f.get("entities") or []
         if entities:
             from . import graph
+            linked_eids: list[int] = []
             for ent in entities:
                 if not isinstance(ent, dict):
                     continue
@@ -544,8 +545,17 @@ async def _index_side_stores(
                     aliases=ent.get("aliases") or [],
                 )
                 if eid:
+                    linked_eids.append(eid)
                     for fid in fact_ids:
                         await asyncio.to_thread(graph.add_edge, fid, eid)
+            # Phase ④: entities just mentioned prime this session's next
+            # search (see priming.py) — ingest and search share the same
+            # buffer so either side of a turn can prime the other.
+            if linked_eids:
+                from . import priming
+                priming.touch(
+                    str(user_id), base_meta.get("channel_id"), linked_eids,
+                )
     except Exception as e:
         log.warning("graph update failed (non-fatal): %s", e)
 

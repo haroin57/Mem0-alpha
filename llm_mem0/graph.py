@@ -312,6 +312,74 @@ def get_related_facts(
     return _store.read(_fetch, what="get_related_facts", default=[]) or []
 
 
+def get_entity_degree(entity_id: int) -> int:
+    """Number of distinct facts linked to this entity — a cheap proxy for
+    how "connected"/hub-like an entity is in the fact graph. Used to
+    normalize co-occurrence weight in get_co_occurring_entities so a
+    high-degree hub entity doesn't dominate every neighborhood purely by
+    virtue of appearing everywhere."""
+    if not entity_id:
+        return 0
+
+    def _fetch(c) -> int:
+        row = c.execute(
+            "SELECT COUNT(*) AS n FROM fact_entity_edges WHERE entity_id=?",
+            (int(entity_id),),
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+    return _store.read(_fetch, what="get_entity_degree", default=0) or 0
+
+
+def get_co_occurring_entities(entity_id: int, *, limit: int = 10) -> list[tuple[int, float]]:
+    """Entities that share at least one fact with ``entity_id``, ranked by a
+    degree-normalized co-occurrence weight — the graph analogue of cosine
+    normalization: ``shared_facts / sqrt(deg(A) * deg(B))``. Without this
+    normalization a very high-degree entity (mentioned in hundreds of facts)
+    would show up as "related" to almost everything purely from its size,
+    the graph equivalent of a stopword dominating a keyword search.
+
+    Used by search._graph_expand_candidates for multi-hop spreading
+    activation (Phase ④) — replaces the previous fixed 1-hop, uniform-score
+    expansion.
+
+    Returns ``[(other_entity_id, weight), ...]`` sorted by weight descending,
+    weight in (0, 1].
+    """
+    if not entity_id:
+        return []
+    deg_a = get_entity_degree(entity_id)
+    if deg_a == 0:
+        return []
+
+    def _fetch(c):
+        return c.execute(
+            """
+            SELECT fe2.entity_id AS other_id, COUNT(*) AS shared
+            FROM fact_entity_edges fe1
+            JOIN fact_entity_edges fe2
+              ON fe1.fact_id = fe2.fact_id AND fe2.entity_id != fe1.entity_id
+            WHERE fe1.entity_id = ?
+            GROUP BY fe2.entity_id
+            ORDER BY shared DESC
+            LIMIT ?
+            """,
+            (int(entity_id), max(limit * 3, limit)),
+        ).fetchall()
+
+    rows = _store.read(_fetch, what="get_co_occurring_entities", default=[]) or []
+    weighted: list[tuple[int, float]] = []
+    for r in rows:
+        other_id = r["other_id"]
+        deg_b = get_entity_degree(other_id)
+        if deg_b == 0:
+            continue
+        w = r["shared"] / ((deg_a * deg_b) ** 0.5)
+        weighted.append((other_id, min(w, 1.0)))
+    weighted.sort(key=lambda x: x[1], reverse=True)
+    return weighted[:limit]
+
+
 def get_fact_entities(fact_id: str) -> list[Entity]:
     """All entities a given fact links to."""
     if not fact_id:

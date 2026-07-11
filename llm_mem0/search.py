@@ -858,73 +858,155 @@ async def search_memories_smart(
 
 
 async def _graph_expand_candidates(
-    candidates: list[dict], user_id: str, *, top_seed: int = 3, per_entity: int = 3,
+    candidates: list[dict], user_id: str, *, top_seed: int = 3, per_entity: int = 5,
     current_channel_id: str | None = None,
 ) -> list[dict]:
-    """1-hop graph expansion via the graph module.
+    """Multi-hop spreading-activation graph expansion (Phase ④).
 
-    For each of the top ``top_seed`` candidates, fetch the entities linked
-    to it, then for each entity fetch up to ``per_entity`` sibling fact
-    ids. Sibling facts are pulled from ChromaDB via mem.get() and merged
-    into the candidate list (deduped by fact id). Boost-prone fields like
-    score are left untouched — the LLM rerank decides ordering downstream.
+    Seeds activation from the top ``top_seed`` cosine candidates
+    (activation = 1 - distance, so a closer hit seeds more strongly), then
+    propagates through co-occurrence-weighted entity edges
+    (``graph.get_co_occurring_entities``) for up to
+    ``MEM0_GRAPH_SPREAD_MAX_HOPS`` hops, multiplying by
+    ``MEM0_GRAPH_SPREAD_DECAY_GAMMA`` at each hop. This mirrors spreading
+    activation in semantic-network models of human memory: activation
+    weakens with graph distance from the retrieval cue, rather than the
+    previous behavior (a flat 1-hop expansion where every sibling got an
+    identical score regardless of how strongly — or weakly — connected it
+    was to the query).
+
+    Session priming (``priming.get_primed_entities``) adds a flat activation
+    top-up for entities touched recently in this (user, channel) — an
+    encoding-specificity effect independent of any stored graph edge. The
+    entities seeding THIS expansion are then themselves recorded via
+    ``priming.touch``, so a topic raised via search can prime a
+    closely-following turn even before enough mentions accumulate to form a
+    real co-occurrence edge.
+
+    Sibling facts are scored by their accumulated activation
+    (``distance = BASE - WEIGHT * activation``, floored) instead of a flat
+    constant, so a strongly, closely connected fact outranks a weakly or
+    distantly connected one, and both stay behind genuine high-cosine hits
+    by construction (BASE exceeds a typical real hit's distance).
     """
     if not candidates:
         return candidates
-    from . import graph
+    from . import graph, priming
     # 初回 init の ChromaDB heartbeat (同期 requests) でループを止めない。
     mem = await asyncio.to_thread(_get_mem0)
     if mem is None:
         return candidates
 
+    max_hops = settings.MEM0_GRAPH_SPREAD_MAX_HOPS
+    decay_gamma = settings.MEM0_GRAPH_SPREAD_DECAY_GAMMA
+    min_activation = settings.MEM0_GRAPH_SPREAD_MIN_ACTIVATION
+
     seen_ids = {c.get("id") for c in candidates if c.get("id")}
-    sibling_ids: list[str] = []
+
+    # --- seed activation from the top cosine candidates -----------------
+    frontier: dict[int, float] = {}
     for c in candidates[:top_seed]:
         fid = c.get("id")
         if not fid:
             continue
+        score = c.get("score")
+        seed_act = 1.0 - min(score, 1.0) if isinstance(score, (int, float)) else 0.5
+        seed_act = max(seed_act, 0.1)
         try:
             entities = await asyncio.to_thread(graph.get_fact_entities, fid)
         except Exception:
             continue
         for e in entities:
+            if seed_act > frontier.get(e.id, 0.0):
+                frontier[e.id] = seed_act
+
+    if not frontier:
+        return candidates
+    seed_entity_ids = list(frontier.keys())
+
+    # --- propagate for up to max_hops, decaying by gamma each hop -------
+    entity_activation: dict[int, float] = {}
+    for _hop in range(max_hops):
+        next_frontier: dict[int, float] = {}
+        for eid, act in frontier.items():
+            entity_activation[eid] = max(act, entity_activation.get(eid, 0.0))
             try:
-                related = await asyncio.to_thread(
-                    graph.get_related_facts, e.id, limit=per_entity,
-                    exclude_fact_ids=list(seen_ids),
+                neighbors = await asyncio.to_thread(
+                    graph.get_co_occurring_entities, eid, limit=per_entity,
                 )
             except Exception:
                 continue
-            for r in related:
-                if r not in seen_ids:
-                    seen_ids.add(r)
-                    sibling_ids.append(r)
+            for other_id, weight in neighbors:
+                propagated = act * weight * decay_gamma
+                if propagated < min_activation:
+                    continue
+                if propagated > max(
+                    entity_activation.get(other_id, 0.0), next_frontier.get(other_id, 0.0),
+                ):
+                    next_frontier[other_id] = propagated
+        if not next_frontier:
+            break
+        frontier = next_frontier
 
-    if not sibling_ids:
+    if not entity_activation:
         return candidates
 
-    # Fetch sibling facts from ChromaDB and merge.
-    siblings: list[dict] = []
-    for fid in sibling_ids:
+    # Session priming top-up + re-priming from this expansion's seeds.
+    try:
+        primed = priming.get_primed_entities(user_id, current_channel_id)
+        bonus = settings.MEM0_PRIMING_ACTIVATION_BONUS
+        for eid in primed:
+            entity_activation[eid] = entity_activation.get(eid, 0.0) + bonus
+        priming.touch(user_id, current_channel_id, seed_entity_ids)
+    except Exception as exc:
+        log.warning("priming buffer failed (non-fatal): %s", exc)
+
+    # --- pull sibling facts for every activated entity -------------------
+    fact_best_activation: dict[str, float] = {}
+    for eid, act in entity_activation.items():
         try:
-            fact = await asyncio.to_thread(mem.get, fid)
-            # Phase R: graph 経由の sibling は search_memories の validity
-            # フィルタを通らないので、archived / 他会話 scope をここで落とす。
-            if (
-                isinstance(fact, dict) and fact.get("memory")
-                and _is_fact_valid(fact, current_channel_id)
-            ):
-                # Sibling facts pulled by graph expansion don't carry a
-                # cosine score. Assign a neutral mid-range distance so they
-                # don't crowd out actual top-cosine matches but still get
-                # surfaced to the LLM rerank for the final call.
-                if fact.get("score") is None:
-                    fact["score"] = 0.8
-                fact["_graph_expanded"] = True
-                siblings.append(fact)
+            related = await asyncio.to_thread(
+                graph.get_related_facts, eid, limit=per_entity,
+                exclude_fact_ids=list(seen_ids),
+            )
         except Exception:
             continue
+        for fid in related:
+            if fid in seen_ids:
+                continue
+            if act > fact_best_activation.get(fid, 0.0):
+                fact_best_activation[fid] = act
+
+    if not fact_best_activation:
+        return candidates
+
+    base_distance = settings.MEM0_GRAPH_SIBLING_BASE_DISTANCE
+    activation_weight = settings.MEM0_GRAPH_SIBLING_ACTIVATION_WEIGHT
+    min_distance = settings.MEM0_GRAPH_SIBLING_MIN_DISTANCE
+    siblings: list[dict] = []
+    for fid, act in fact_best_activation.items():
+        try:
+            fact = await asyncio.to_thread(mem.get, fid)
+        except Exception:
+            continue
+        # Phase R: graph 経由の sibling は search_memories の validity
+        # フィルタを通らないので、archived / 他会話 scope をここで落とす。
+        if not (
+            isinstance(fact, dict) and fact.get("memory")
+            and _is_fact_valid(fact, current_channel_id)
+        ):
+            continue
+        fact["score"] = max(min_distance, base_distance - activation_weight * act)
+        fact["_graph_expanded"] = True
+        fact["_graph_activation"] = act
+        siblings.append(fact)
+        seen_ids.add(fid)
+
     if siblings:
-        log.info("graph_expand: added %d sibling facts via 1-hop", len(siblings))
+        log.info(
+            "graph_expand: added %d sibling facts via spreading activation "
+            "(max_hops=%d, entities_activated=%d)",
+            len(siblings), max_hops, len(entity_activation),
+        )
         candidates = candidates + siblings
     return candidates

@@ -118,6 +118,22 @@ _SPECS: dict[str, _Spec] = {
     # surfaced by smart search; rate-limited per fact (spacing effect).
     "MEM0_RECALL_REINFORCE_ENABLED": _Spec(False, _parse_bool),
     "MEM0_RECALL_REINFORCE_MIN_INTERVAL_SEC": _Spec(6 * 3600, int),
+    # Phase ④: spreading-activation graph expansion (Collins & Loftus-style
+    # activation decaying with graph distance; see search._graph_expand_candidates).
+    "MEM0_GRAPH_SPREAD_MAX_HOPS": _Spec(2, int),
+    "MEM0_GRAPH_SPREAD_DECAY_GAMMA": _Spec(0.5, float),
+    "MEM0_GRAPH_SPREAD_MIN_ACTIVATION": _Spec(0.05, float),
+    # Sibling distance = BASE - WEIGHT * activation, floored at MIN. BASE
+    # stays above a typical real cosine hit's distance so graph-expanded
+    # facts never systematically outrank genuine vector/BM25 matches.
+    "MEM0_GRAPH_SIBLING_BASE_DISTANCE": _Spec(0.9, float),
+    "MEM0_GRAPH_SIBLING_ACTIVATION_WEIGHT": _Spec(0.4, float),
+    "MEM0_GRAPH_SIBLING_MIN_DISTANCE": _Spec(0.3, float),
+    # Session priming buffer (priming.py): flat activation top-up for
+    # entities touched recently in this (user, channel).
+    "MEM0_PRIMING_ACTIVATION_BONUS": _Spec(0.1, float),
+    "MEM0_PRIMING_TTL_SEC": _Spec(30 * 60, int),
+    "MEM0_PRIMING_MAX_ENTITIES": _Spec(20, int),
     # History embedding: semantic recall over the raw transcript, in a
     # separate Chroma collection. Off by default — each line costs one
     # embedding call.
