@@ -209,6 +209,17 @@ _SPECS: dict[str, _Spec] = {
     "MEM0_BATCH_SIZE": _Spec(10, int),
     "MEM0_BATCH_TURN_CHARS": _Spec(600, int),
 
+    # --- Prompt-block framing (format.py) ------------------------------------
+    # The header/legend/footer lines wrapping the memories block. Hosts with
+    # an existing prompt scaffold that anchors on specific marker strings
+    # (and mirrors them in their injection-defense sentinels) can override
+    # these to keep prompt bytes identical across a migration.
+    "MEM0_FORMAT_HEADER": _Spec("[Long-term memory — facts about this user]", str),
+    "MEM0_FORMAT_LEGEND": _Spec(
+        "(legend: imp=importance 1-5 / Live>Hot>Warm>Cold=freshness tier / "
+        "[date]=last confirmed / [条件: ...]=only holds under that condition)", str),
+    "MEM0_FORMAT_FOOTER": _Spec("[End of Long-term memory]", str),
+
     # --- MCP server -------------------------------------------------------------
     # Default user_id for MCP tools when the client doesn't pass one; keeps
     # single-user client configs (Claude Code / Desktop) to zero arguments.
