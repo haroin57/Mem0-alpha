@@ -44,6 +44,21 @@ def get_auth_backend() -> AuthBackend:
     return _backend
 
 
+def set_auth_backend(backend: AuthBackend) -> None:
+    """Explicitly install an auth backend, bypassing auto-detection.
+
+    Host applications with their own credential management (an existing
+    OAuth manager, a billing-routing wrapper, a provider fallback chain)
+    implement :class:`AuthBackend` and inject it here — before the first
+    LLM-touching operation — instead of letting ``get_auth_backend`` probe
+    the environment. Injection wins over auto-detection because
+    ``get_auth_backend`` returns any cached backend first.
+    """
+    global _backend
+    _backend = backend
+    log.info("llm_mem0: auth backend injected (%s)", type(backend).__name__)
+
+
 def reset_auth_backend() -> None:
     """Clear the cached backend. Mainly useful for tests."""
     global _backend
@@ -69,4 +84,5 @@ __all__ = [
     "aclose_auth_backend",
     "get_auth_backend",
     "reset_auth_backend",
+    "set_auth_backend",
 ]

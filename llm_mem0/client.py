@@ -31,6 +31,8 @@ MEM0_RELEVANCE_THRESHOLD = MEM0_RELEVANCE_MAX_DISTANCE
 
 _mem0_instance = None
 _mem0_provider: str | None = None
+# AuthBackend.provider_id() snapshot at build time — drift triggers rebuild.
+_mem0_provider_id: str | None = None
 # Last init failure timestamp (monotonic seconds). When set, _get_mem0()
 # returns None without re-trying until _INIT_RETRY_COOLDOWN_SEC has elapsed.
 # This allows automatic recovery after a transient ChromaDB outage instead of
@@ -101,6 +103,26 @@ def _ping_chromadb_if_server_mode() -> None:
     r.raise_for_status()
 
 
+def _sync_backend_state(mem) -> None:
+    """Give the auth backend a chance to sync rotated credentials onto the
+    memory store's internal LLM client. Best-effort — a hook failure must
+    never take down store access."""
+    try:
+        get_auth_backend().refresh_memory_llm(mem)
+    except Exception as exc:
+        log.warning("auth backend refresh_memory_llm failed (non-fatal): %s", exc)
+
+
+def _provider_drifted() -> bool:
+    """True when the auth backend's effective provider changed since the
+    cached instance was built (e.g. OAuth session lost → API-key fallback,
+    or restored). Best-effort: an erroring hook never forces a rebuild."""
+    try:
+        return get_auth_backend().provider_id() != _mem0_provider_id
+    except Exception:
+        return False
+
+
 def _get_mem0():
     """Lazy-init singleton mem0 Memory instance with cooldown-based retry.
 
@@ -109,17 +131,30 @@ def _get_mem0():
     ChromaDB outage recovers automatically instead of disabling the store
     for the rest of the process lifetime.
 
+    Provider drift (``AuthBackend.provider_id`` changing between calls)
+    rebuilds the instance so the store's internal LLM follows a runtime
+    provider switch; ``AuthBackend.refresh_memory_llm`` runs on every
+    hand-out so rotated OAuth tokens propagate to the cached instance.
+
     NOTE: first init does a synchronous ChromaDB heartbeat +
     Memory.from_config; call via ``asyncio.to_thread`` from event loops.
     """
-    global _mem0_instance, _mem0_provider, _init_failed_at
+    global _mem0_instance, _mem0_provider, _mem0_provider_id, _init_failed_at
 
-    if _mem0_instance is not None:
+    if _mem0_instance is not None and not _provider_drifted():
+        _sync_backend_state(_mem0_instance)
         return _mem0_instance
 
     with _init_lock:
         if _mem0_instance is not None:
-            return _mem0_instance
+            if not _provider_drifted():
+                _sync_backend_state(_mem0_instance)
+                return _mem0_instance
+            log.info(
+                "mem0 provider drift detected (%s -> %s) — rebuilding instance",
+                _mem0_provider_id, get_auth_backend().provider_id(),
+            )
+            _mem0_instance = None
         if (
             _init_failed_at is not None
             and (time.monotonic() - _init_failed_at) < _INIT_RETRY_COOLDOWN_SEC
@@ -132,7 +167,12 @@ def _get_mem0():
             cfg = _build_config()
             _mem0_instance = Memory.from_config(cfg)
             _mem0_provider = cfg["llm"]["provider"]
+            try:
+                _mem0_provider_id = get_auth_backend().provider_id()
+            except Exception:
+                _mem0_provider_id = None
             _init_failed_at = None
+            _sync_backend_state(_mem0_instance)
             vs_cfg = cfg["vector_store"]["config"]
             store_id = vs_cfg.get("path") or f'{vs_cfg.get("host")}:{vs_cfg.get("port")}'
             log.info(
