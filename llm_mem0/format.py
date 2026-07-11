@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from .llm import strip_json_fence  # noqa: F401 — re-export (moved to llm.py)
 from .sanitize import POWER_PHRASE_RE
+from .settings import settings
 
 # Markers an attacker could have stored in a fact (via the ingestion path)
 # that would close the <retrieved_memories> fence or impersonate any trusted
@@ -120,9 +121,8 @@ def format_memories_for_prompt(memories: list[dict]) -> str:
         return ""
 
     lines = [
-        "[Long-term memory — facts about this user]",
-        "(legend: imp=importance 1-5 / Live>Hot>Warm>Cold=freshness tier / "
-        "[date]=last confirmed / [条件: ...]=only holds under that condition)",
+        settings.MEM0_FORMAT_HEADER,
+        settings.MEM0_FORMAT_LEGEND,
     ]
     # core memory（常時注入枠）を先頭に固定し、クエリ依存の recall と区別する。
     ordered = sorted(
@@ -137,7 +137,7 @@ def format_memories_for_prompt(memories: list[dict]) -> str:
             "(このクエリに一致する具体的な記憶は見つからなかった。"
             "推測で補完しないこと)"
         )
-    lines.append("[End of Long-term memory]")
+    lines.append(settings.MEM0_FORMAT_FOOTER)
     return "\n".join(lines)
 
 
