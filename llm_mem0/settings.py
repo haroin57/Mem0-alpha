@@ -105,6 +105,19 @@ _SPECS: dict[str, _Spec] = {
     # Reinforcement boost age-decay component.
     "MEM0_BOOST_ALPHA_AGE": _Spec(0.03, float),
     "MEM0_BOOST_AGE_HALF_LIFE_DAYS": _Spec(90.0, float),
+    # Boost formula: "legacy" (hand-tuned freq+recency+age) or "actr"
+    # (power-law base-level activation). legacy stays the default until the
+    # ACT-R mode has been A/B compared in production.
+    "MEM0_BOOST_MODE": _Spec("legacy", str),
+    # ACT-R base-level activation knobs (MEM0_BOOST_MODE=actr).
+    "MEM0_ACTR_DECAY_D": _Spec(0.5, float),
+    "MEM0_ACTR_BOOST_ALPHA": _Spec(0.2, float),
+    "MEM0_ACTR_RETRIEVAL_THRESHOLD": _Spec(-7.5, float),
+    "MEM0_ACTR_NOISE_S": _Spec(1.0, float),
+    # Recall-time (testing effect) reinforcement: fires when a fact is
+    # surfaced by smart search; rate-limited per fact (spacing effect).
+    "MEM0_RECALL_REINFORCE_ENABLED": _Spec(False, _parse_bool),
+    "MEM0_RECALL_REINFORCE_MIN_INTERVAL_SEC": _Spec(6 * 3600, int),
     # History embedding: semantic recall over the raw transcript, in a
     # separate Chroma collection. Off by default — each line costs one
     # embedding call.
