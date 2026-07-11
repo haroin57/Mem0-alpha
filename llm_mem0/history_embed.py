@@ -16,44 +16,48 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
+
+from .settings import settings
 
 log = logging.getLogger(__name__)
 
 _COLLECTION_NAME = "history_transcripts"
 _state: dict = {"col": None}
+_state_lock = threading.Lock()
 
 
 def _enabled() -> bool:
-    try:
-        from .settings import MEM0_HISTORY_EMBED_ENABLED
-        return bool(MEM0_HISTORY_EMBED_ENABLED)
-    except Exception:
-        return False
+    return settings.MEM0_HISTORY_EMBED_ENABLED
 
 
 def _get_collection():
     """Lazily get/create the raw-transcript collection (cosine, OpenAI embeds).
 
-    Reuses the same ChromaDB server + embedding model as Mem0 so the vectors are
-    comparable. Cached for the process. Patched out in tests.
+    Reuses the same ChromaDB server + embedding model as Mem0 so the vectors
+    are comparable. Cached for the process (double-checked lock so two
+    threads can't build two clients). Patched out in tests.
     """
     if _state["col"] is not None:
         return _state["col"]
-    import chromadb
-    from chromadb.utils import embedding_functions
+    with _state_lock:
+        if _state["col"] is not None:
+            return _state["col"]
+        import chromadb
+        from chromadb.utils import embedding_functions
 
-    host = os.environ.get("CHROMA_HOST", "127.0.0.1")
-    port = int(os.environ.get("CHROMA_PORT", "8765"))
-    model = os.environ.get("MEM0_EMBEDDER_MODEL", "text-embedding-3-small")
-    ef = embedding_functions.OpenAIEmbeddingFunction(
-        api_key=os.environ.get("OPENAI_API_KEY"), model_name=model,
-    )
-    client = chromadb.HttpClient(host=host, port=port)
-    _state["col"] = client.get_or_create_collection(
-        name=_COLLECTION_NAME,
-        embedding_function=ef,
-        metadata={"hnsw:space": "cosine"},
-    )
+        ef = embedding_functions.OpenAIEmbeddingFunction(
+            api_key=os.environ.get("OPENAI_API_KEY"),
+            model_name=settings.MEM0_EMBEDDER_MODEL,
+        )
+        client = chromadb.HttpClient(
+            host=settings.CHROMA_HOST, port=settings.CHROMA_PORT,
+        )
+        _state["col"] = client.get_or_create_collection(
+            name=_COLLECTION_NAME,
+            embedding_function=ef,
+            metadata={"hnsw:space": "cosine"},
+        )
     return _state["col"]
 
 
@@ -68,12 +72,7 @@ def safe_text(text: str) -> str:
     The embedding API hard-rejects oversized inputs; for a recall index the
     head of a long line carries the topic, so truncation is fine.
     """
-    try:
-        from .settings import MEM0_HISTORY_EMBED_MAX_CHARS
-        cap = MEM0_HISTORY_EMBED_MAX_CHARS
-    except Exception:
-        cap = 4000
-    return (text or "")[:cap]
+    return (text or "")[:settings.MEM0_HISTORY_EMBED_MAX_CHARS]
 
 
 def index_line(channel_id, ts: str, role: str, author: str, text: str) -> None:
@@ -110,11 +109,7 @@ def search_semantic(query: str, channel_id, limit: int | None = None) -> list[di
     if not _enabled():
         return []
     if limit is None:
-        try:
-            from .settings import MEM0_HISTORY_EMBED_LIMIT
-            limit = MEM0_HISTORY_EMBED_LIMIT
-        except Exception:
-            limit = 5
+        limit = settings.MEM0_HISTORY_EMBED_LIMIT
     try:
         col = _get_collection()
         res = col.query(

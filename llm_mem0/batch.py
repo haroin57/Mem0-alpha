@@ -1,11 +1,18 @@
 """Per-channel turn accumulator for batch memory ingestion.
 
 Instead of writing to the memory store every turn, turns are accumulated on
-disk and flushed as a single batch when the count reaches BATCH_SIZE
-(default 10). This reduces LLM extraction calls from N to 1 per batch window.
+disk and flushed as a single batch when the count reaches
+``settings.MEM0_BATCH_SIZE`` (default 10). This reduces LLM extraction calls
+from N to 1 per batch window.
 
 State files live under ``.state/mem0_batch/{channel_id}.json`` and survive
 process restarts. The next session picks up where the previous one left off.
+
+Concurrency: every mutation is a read-modify-write of the JSON file.
+``atomic_write_json`` prevents torn files but NOT lost updates, so all
+mutations are serialized under a process-wide lock (callers invoke these
+sync functions directly or via ``asyncio.to_thread``; either way the lock
+covers them). Cross-process ingestion should stick to one writer process.
 """
 
 from __future__ import annotations
@@ -13,14 +20,26 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 
 from .atomic_write import atomic_write_json
+from .settings import settings
 
 log = logging.getLogger(__name__)
 
-BATCH_SIZE = int(os.environ.get("MEM0_BATCH_SIZE", "10"))
+# Back-compat module constant (frozen at import); live value is
+# settings.MEM0_BATCH_SIZE.
+BATCH_SIZE = settings.MEM0_BATCH_SIZE
+
+# Per-turn storage caps: protect the batch file from one pathological turn.
+# build_batch_summary applies the (smaller) prompt-facing cap on read.
+_TURN_USER_MAX_CHARS = 2000
+_TURN_ASSISTANT_MAX_CHARS = 3000
+
+# Serializes load→mutate→save across threads (lost-update guard).
+_batch_lock = threading.Lock()
 
 
 def _batch_dir(state_dir: str | os.PathLike) -> Path:
@@ -60,16 +79,17 @@ def append_turn(
     assistant_text: str,
 ) -> int:
     """Append a conversation turn and return the updated count."""
-    data = _load_raw(state_dir, channel_id)
-    turns = data.get("turns", [])
-    turns.append({
-        "user": user_text[:2000],
-        "assistant": assistant_text[:3000],
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-    })
-    data["turns"] = turns
-    _save_raw(state_dir, channel_id, data)
-    return len(turns)
+    with _batch_lock:
+        data = _load_raw(state_dir, channel_id)
+        turns = data.get("turns", [])
+        turns.append({
+            "user": user_text[:_TURN_USER_MAX_CHARS],
+            "assistant": assistant_text[:_TURN_ASSISTANT_MAX_CHARS],
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        })
+        data["turns"] = turns
+        _save_raw(state_dir, channel_id, data)
+        return len(turns)
 
 
 def build_batch_summary(turns: list[dict], turn_chars: int | None = None) -> str:
@@ -80,7 +100,7 @@ def build_batch_summary(turns: list[dict], turn_chars: int | None = None) -> str
     documented knob rather than a magic ``[:300]``.
     """
     if turn_chars is None:
-        turn_chars = int(os.environ.get("MEM0_BATCH_TURN_CHARS", "600"))
+        turn_chars = settings.MEM0_BATCH_TURN_CHARS
     return "\n".join(
         f"user: {(t.get('user') or '')[:turn_chars]}\n"
         f"assistant: {(t.get('assistant') or '')[:turn_chars]}"
@@ -96,11 +116,12 @@ def append_extracted_facts(
     """Accumulate LLM-extracted facts for batch flush."""
     if not facts:
         return
-    data = _load_raw(state_dir, channel_id)
-    existing = data.get("extracted_facts", [])
-    existing.extend(facts)
-    data["extracted_facts"] = existing
-    _save_raw(state_dir, channel_id, data)
+    with _batch_lock:
+        data = _load_raw(state_dir, channel_id)
+        existing = data.get("extracted_facts", [])
+        existing.extend(facts)
+        data["extracted_facts"] = existing
+        _save_raw(state_dir, channel_id, data)
 
 
 def pop_batch(
@@ -109,10 +130,13 @@ def pop_batch(
 ) -> tuple[list[dict], list[str]]:
     """Return all accumulated turns + extracted facts and reset the file.
 
-    Returns ``(turns, extracted_facts)``.
+    Returns ``(turns, extracted_facts)``. Atomic w.r.t. the other mutators:
+    a turn appended concurrently either lands in this pop or in the next
+    batch, never in neither.
     """
-    data = _load_raw(state_dir, channel_id)
-    turns = data.get("turns", [])
-    extracted_facts = data.get("extracted_facts", [])
-    _save_raw(state_dir, channel_id, {"turns": [], "extracted_facts": []})
-    return turns, extracted_facts
+    with _batch_lock:
+        data = _load_raw(state_dir, channel_id)
+        turns = data.get("turns", [])
+        extracted_facts = data.get("extracted_facts", [])
+        _save_raw(state_dir, channel_id, {"turns": [], "extracted_facts": []})
+        return turns, extracted_facts

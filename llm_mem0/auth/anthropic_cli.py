@@ -18,12 +18,13 @@ import logging
 import os
 import stat
 import sys
-import tempfile
 import threading
 import time
 
 import aiohttp
 
+from ..atomic_write import atomic_write_json
+from ..settings import DEFAULT_HELPER_MODEL, settings
 from .base import AuthBackend
 
 log = logging.getLogger(__name__)
@@ -119,20 +120,17 @@ def _oauth_headers(extra: dict | None = None) -> dict:
     return out
 
 
-# macOS: the Claude Code CLI stores its OAuth credentials in the login
-# Keychain (as a generic password under this service name) rather than in the
-# plaintext JSON file, so on darwin we read the Keychain first and fall back to
-# the file. Set LLM_MEM0_DISABLE_KEYCHAIN=1 to force the file path.
-_KEYCHAIN_SERVICE = os.environ.get("CLAUDE_CLI_KEYCHAIN_SERVICE", "Claude Code-credentials")
-
-# A direct token refresh ROTATES the refresh token, which invalidates the copy
-# the Claude Code CLI holds unless we can write the new one back to the same
-# store. We can do that for the file store; we cannot reliably do it for the
-# macOS Keychain. So when the token came from the Keychain we do NOT refresh by
-# default — we rely on the CLI's own refresh cycle (re-reading the store) and
-# only refresh directly if the user opts in, accepting they may need to
-# `claude` re-login afterward.
-_ALLOW_KEYCHAIN_REFRESH = os.environ.get("LLM_MEM0_ALLOW_TOKEN_REFRESH", "0") == "1"
+# NOTE on the Keychain flags (settings.CLAUDE_CLI_KEYCHAIN_SERVICE,
+# settings.LLM_MEM0_DISABLE_KEYCHAIN, settings.LLM_MEM0_ALLOW_TOKEN_REFRESH):
+# macOS keeps the CLI's OAuth credentials in the login Keychain rather than
+# the plaintext JSON file, so on darwin we read the Keychain first and fall
+# back to the file. A direct token refresh ROTATES the refresh token, which
+# invalidates the copy the Claude Code CLI holds unless we can write the new
+# one back to the same store. We can do that for the file store; we cannot
+# reliably do it for the macOS Keychain. So when the token came from the
+# Keychain we do NOT refresh by default — we rely on the CLI's own refresh
+# cycle (re-reading the store) and only refresh directly if the user opts in
+# via LLM_MEM0_ALLOW_TOKEN_REFRESH=1, accepting a possible CLI re-login.
 
 
 def _read_credentials_from_keychain() -> dict | None:
@@ -141,13 +139,14 @@ def _read_credentials_from_keychain() -> dict | None:
     Returns the ``claudeAiOauth`` sub-dict, or None when the entry is absent,
     access is denied, or we're not on macOS. Best-effort — never raises.
     """
-    if sys.platform != "darwin" or os.environ.get("LLM_MEM0_DISABLE_KEYCHAIN") == "1":
+    if sys.platform != "darwin" or settings.LLM_MEM0_DISABLE_KEYCHAIN:
         return None
     import subprocess
     try:
         # -w prints only the secret value (the JSON blob) to stdout.
         out = subprocess.run(
-            ["security", "find-generic-password", "-s", _KEYCHAIN_SERVICE, "-w"],
+            ["security", "find-generic-password",
+             "-s", settings.CLAUDE_CLI_KEYCHAIN_SERVICE, "-w"],
             capture_output=True, text=True, timeout=5,
         )
         if out.returncode != 0 or not out.stdout.strip():
@@ -175,11 +174,11 @@ def _save_credentials(access: str, refresh: str, expires_at: int, *, path: str |
     """Write refreshed tokens back to the credentials file (atomic write).
 
     On POSIX, defensive ordering: verify the directory and file are
-    privately-owned before touching them, then fchmod the new fd to 0o600
-    BEFORE any content lands in it, so there's no window where a co-tenant
-    could read a plaintext token off an unprotected tempfile. On Windows those
-    steps are no-ops — the file inherits the user profile's ACLs — and the
-    atomic ``os.replace`` still applies.
+    privately-owned before touching them, then hand off to
+    ``atomic_write_json`` (0o600 before content, fsync, ``os.replace``) so
+    there's no window where a co-tenant could read a plaintext token off an
+    unprotected tempfile. On Windows the mode is a no-op — the file inherits
+    the user profile's ACLs — and the atomic replace still applies.
     """
     if path is None:
         path = CREDENTIALS_PATH
@@ -204,19 +203,7 @@ def _save_credentials(access: str, refresh: str, expires_at: int, *, path: str |
         oauth["expiresAt"] = expires_at
         data["claudeAiOauth"] = oauth
 
-        fd, tmp_path = tempfile.mkstemp(dir=creds_dir, suffix=".tmp")
-        try:
-            if hasattr(os, "fchmod"):  # POSIX; on Windows the file inherits user-profile ACLs
-                os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w") as f:
-                json.dump(data, f)
-            os.replace(tmp_path, path)
-        except BaseException:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        atomic_write_json(path, data, mode=0o600, indent=None)
     except Exception as exc:
         log.warning("Failed to save Claude Code CLI credentials: %s", exc)
 
@@ -370,7 +357,7 @@ class AnthropicCliAuth(AuthBackend):
         # opt-in. Otherwise we leave the CLI's token untouched and return what
         # we have (callers treat an unusable token as "no memory this turn").
         if self._is_expired() and self._refresh_token:
-            if self._source == "keychain" and not _ALLOW_KEYCHAIN_REFRESH:
+            if self._source == "keychain" and not settings.LLM_MEM0_ALLOW_TOKEN_REFRESH:
                 log.warning(
                     "Claude Code CLI token (from Keychain) is expired and the CLI "
                     "hasn't refreshed it. Not refreshing directly, to avoid "
@@ -405,7 +392,7 @@ class AnthropicCliAuth(AuthBackend):
         return self._client
 
     def default_model(self) -> str:
-        return os.environ.get("MEM0_LLM_MODEL", "claude-haiku-4-5-20251001")
+        return settings.MEM0_LLM_MODEL or DEFAULT_HELPER_MODEL
 
     def mem0_llm_config(self, *, model: str) -> dict:
         # No api_key here — the SDK patch injects auth_token when mem0
@@ -434,3 +421,24 @@ class AnthropicCliAuth(AuthBackend):
         except Exception as exc:
             log.warning("AnthropicCliAuth.complete failed: %s", exc)
             return ""
+
+    async def aclose(self) -> None:
+        """Close the cached aiohttp session and Anthropic client.
+
+        The backend is a process-wide singleton, so this matters mainly for
+        embedded hosts and tests that build/tear down event loops — without
+        it every loop teardown logs "Unclosed client session".
+        """
+        session, self._http_session = self._http_session, None
+        if session is not None and not session.closed:
+            try:
+                await session.close()
+            except Exception as exc:
+                log.debug("AnthropicCliAuth.aclose(session): %s", exc)
+        client, self._client = self._client, None
+        self._client_token = None
+        if client is not None:
+            try:
+                await client.close()
+            except Exception as exc:
+                log.debug("AnthropicCliAuth.aclose(client): %s", exc)

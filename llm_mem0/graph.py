@@ -10,25 +10,21 @@ Use cases this enables that pure cosine retrieval can't:
   - 表記揺れ吸収 (Namitape / ナミテープ) via entity_aliases
   - Entity 単位の言及頻度集計
 
-Tables (see schema below) are created on first import with safe defaults.
-SQLite is concurrent-safe for our scale (~1500 facts, single bot process
-ingesting + ad-hoc scripts running). WAL mode is enabled so reads don't
-block writes.
-
-The module is intentionally synchronous; callers wrap with asyncio.to_thread
-when invoked from an event loop.
+Storage plumbing (WAL-once init, busy_timeout, locked writes with retry)
+lives in :mod:`llm_mem0.sqlite_store`. The module is intentionally
+synchronous; callers wrap with asyncio.to_thread when invoked from an
+event loop.
 """
 
 from __future__ import annotations
 
 import logging
-import os
-import sqlite3
 import threading
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterable
+
+from .sqlite_store import SqliteStore
 
 log = logging.getLogger(__name__)
 
@@ -94,39 +90,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_relations_unique_open
     WHERE valid_to IS NULL;
 """
 
-
-# ---------------------------------------------------------------------------
-# Connection management
-# ---------------------------------------------------------------------------
-_db_lock = threading.Lock()
-_db_path: str | None = None
+_store = SqliteStore("mem0_graph.sqlite", _SCHEMA)
 
 
-def _resolve_db_path() -> str:
-    global _db_path
-    if _db_path is None:
-        from .settings import STATE_DIR
-        os.makedirs(STATE_DIR, exist_ok=True)
-        _db_path = os.path.join(STATE_DIR, "mem0_graph.sqlite")
-    return _db_path
-
-
-@contextmanager
-def _conn():
-    """Open a connection with WAL + foreign keys, ensure schema, hand it out."""
-    path = _resolve_db_path()
-    # check_same_thread=False — bot.py + scripts call from various threads
-    # via asyncio.to_thread. _db_lock serializes writes; reads are safe.
-    c = sqlite3.connect(path, check_same_thread=False)
-    c.row_factory = sqlite3.Row
-    try:
-        c.execute("PRAGMA journal_mode=WAL")
-        c.execute("PRAGMA foreign_keys=ON")
-        with _db_lock:
-            c.executescript(_SCHEMA)
-        yield c
-    finally:
-        c.close()
+def _reset_db_path_for_test(path: str | None) -> None:
+    """Test hook — pytest fixtures point the module at a tempfile."""
+    _store.reset_path_for_test(path)
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +151,7 @@ def _resolve_appellation(name: str, user_id: str) -> tuple[str, list[str]]:
 def upsert_entity(
     name: str, type: str, user_id: str, *, aliases: Iterable[str] = (),
 ) -> int:
-    """Insert-or-update an entity. Returns the entity id.
+    """Insert-or-update an entity. Returns the entity id (0 on failure).
 
     Alias-aware lookup order (§1 of docs/mem0-dedup-issues.md):
       1. Resolve appellations (``boss`` → ``alice``) before any DB lookup.
@@ -205,8 +174,6 @@ def upsert_entity(
             norm_aliases.append(a)
             seen.add(a)
     now = int(time.time())
-    # Build the surface-form set used both for lookup and for later alias
-    # registration. We use it twice so collapse to a tuple after dedup.
     surface_forms = (name, *norm_aliases)
     placeholders = ",".join("?" for _ in surface_forms)
     lookup_sql = (
@@ -217,7 +184,8 @@ def upsert_entity(
         f"WHERE alias IN ({placeholders}))"
         f") LIMIT 1"
     )
-    with _conn() as c, _db_lock:
+
+    def _upsert(c) -> int:
         row = c.execute(
             lookup_sql, (user_id, *surface_forms, *surface_forms),
         ).fetchone()
@@ -243,33 +211,32 @@ def upsert_entity(
             "SELECT canonical_name FROM entities WHERE id=?", (eid,),
         ).fetchone()["canonical_name"]
         for sf in surface_forms:
-            if sf == existing_canonical:
-                continue
-            try:
+            if sf != existing_canonical:
                 c.execute(
                     "INSERT OR IGNORE INTO entity_aliases(entity_id, alias) "
                     "VALUES (?, ?)",
                     (eid, sf),
                 )
-            except sqlite3.IntegrityError:
-                pass
-        c.commit()
-    _invalidate_top_entities_cache(user_id)
-    return int(eid)
+        return int(eid)
+
+    eid = _store.write(_upsert, what="upsert_entity", default=0) or 0
+    if eid:
+        _invalidate_top_entities_cache(user_id)
+    return eid
 
 
 def find_entity(query: str, user_id: str, *, fuzzy: bool = True) -> Entity | None:
     """Resolve a free-form name to an entity. Tries (in order):
     1. exact canonical_name match
-    2. alias match (case-insensitive)
+    2. alias match
     3. (if fuzzy) prefix match against canonical names
     Returns None if nothing reasonable matches.
     """
     q = _normalize_name(query)
     if not q:
         return None
-    with _conn() as c:
-        # 1) canonical exact
+
+    def _find(c) -> Entity | None:
         row = c.execute(
             "SELECT id, canonical_name, type, user_id, mention_count "
             "FROM entities WHERE canonical_name=? AND user_id=?",
@@ -277,7 +244,6 @@ def find_entity(query: str, user_id: str, *, fuzzy: bool = True) -> Entity | Non
         ).fetchone()
         if row:
             return Entity(**dict(row))
-        # 2) alias exact
         row = c.execute(
             "SELECT e.id, e.canonical_name, e.type, e.user_id, e.mention_count "
             "FROM entities e JOIN entity_aliases a ON a.entity_id=e.id "
@@ -288,7 +254,7 @@ def find_entity(query: str, user_id: str, *, fuzzy: bool = True) -> Entity | Non
             return Entity(**dict(row))
         if not fuzzy:
             return None
-        # 3) prefix fuzzy — most-mentioned wins
+        # prefix fuzzy — most-mentioned wins
         row = c.execute(
             "SELECT id, canonical_name, type, user_id, mention_count "
             "FROM entities WHERE user_id=? AND canonical_name LIKE ? "
@@ -296,6 +262,8 @@ def find_entity(query: str, user_id: str, *, fuzzy: bool = True) -> Entity | Non
             (user_id, f"{q}%"),
         ).fetchone()
         return Entity(**dict(row)) if row else None
+
+    return _store.read(_find, what="find_entity", default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -306,18 +274,16 @@ def add_edge(fact_id: str, entity_id: int, *, role: str | None = None) -> bool:
     if not fact_id or not entity_id:
         return False
     now = int(time.time())
-    with _conn() as c, _db_lock:
-        try:
-            c.execute(
-                "INSERT OR IGNORE INTO fact_entity_edges(fact_id, entity_id, "
-                "role, created_at) VALUES (?, ?, ?, ?)",
-                (fact_id, int(entity_id), role, now),
-            )
-            c.commit()
-            return True
-        except Exception as exc:
-            log.warning("add_edge(%s, %s) failed: %s", fact_id, entity_id, exc)
-            return False
+
+    def _insert(c) -> bool:
+        c.execute(
+            "INSERT OR IGNORE INTO fact_entity_edges(fact_id, entity_id, "
+            "role, created_at) VALUES (?, ?, ?, ?)",
+            (fact_id, int(entity_id), role, now),
+        )
+        return True
+
+    return bool(_store.write(_insert, what="add_edge", default=False))
 
 
 def get_related_facts(
@@ -327,34 +293,40 @@ def get_related_facts(
     if not entity_id:
         return []
     excl = set(exclude_fact_ids or ())
-    with _conn() as c:
+
+    def _fetch(c) -> list[str]:
         rows = c.execute(
             "SELECT fact_id FROM fact_entity_edges WHERE entity_id=? "
             "ORDER BY created_at DESC LIMIT ?",
             (int(entity_id), max(limit + len(excl), 1)),
         ).fetchall()
-    out: list[str] = []
-    for r in rows:
-        fid = r["fact_id"]
-        if fid not in excl:
-            out.append(fid)
-            if len(out) >= limit:
-                break
-    return out
+        out: list[str] = []
+        for r in rows:
+            fid = r["fact_id"]
+            if fid not in excl:
+                out.append(fid)
+                if len(out) >= limit:
+                    break
+        return out
+
+    return _store.read(_fetch, what="get_related_facts", default=[]) or []
 
 
 def get_fact_entities(fact_id: str) -> list[Entity]:
     """All entities a given fact links to."""
     if not fact_id:
         return []
-    with _conn() as c:
+
+    def _fetch(c) -> list[Entity]:
         rows = c.execute(
             "SELECT e.id, e.canonical_name, e.type, e.user_id, e.mention_count "
             "FROM entities e JOIN fact_entity_edges fe ON fe.entity_id=e.id "
             "WHERE fe.fact_id=?",
             (fact_id,),
         ).fetchall()
-    return [Entity(**dict(r)) for r in rows]
+        return [Entity(**dict(r)) for r in rows]
+
+    return _store.read(_fetch, what="get_fact_entities", default=[]) or []
 
 
 def get_aliases(entity_id: int) -> list[str]:
@@ -362,12 +334,15 @@ def get_aliases(entity_id: int) -> list[str]:
     Used by search.py to expand a query into canonical + alias variants."""
     if not entity_id:
         return []
-    with _conn() as c:
+
+    def _fetch(c) -> list[str]:
         rows = c.execute(
             "SELECT alias FROM entity_aliases WHERE entity_id=?",
             (entity_id,),
         ).fetchall()
-    return [r["alias"] for r in rows]
+        return [r["alias"] for r in rows]
+
+    return _store.read(_fetch, what="get_aliases", default=[]) or []
 
 
 def delete_fact_edges(fact_id: str) -> int:
@@ -375,12 +350,14 @@ def delete_fact_edges(fact_id: str) -> int:
     Returns the number of rows removed."""
     if not fact_id:
         return 0
-    with _conn() as c, _db_lock:
+
+    def _delete(c) -> int:
         cur = c.execute(
             "DELETE FROM fact_entity_edges WHERE fact_id=?", (fact_id,)
         )
-        c.commit()
         return cur.rowcount or 0
+
+    return _store.write(_delete, what="delete_fact_edges", default=0) or 0
 
 
 # ---------------------------------------------------------------------------
@@ -423,24 +400,27 @@ def get_top_entities(user_id: str, limit: int = 30) -> list[str]:
         hit = _top_entities_cache.get(key)
         if hit and hit[0] > now:
             return list(hit[1])
-    with _conn() as c:
+
+    def _fetch(c) -> list[str]:
         rows = c.execute(
             "SELECT canonical_name FROM entities "
             "WHERE user_id=? AND mention_count >= 2 "
             "ORDER BY mention_count DESC, id ASC LIMIT ?",
             (str(user_id), int(limit)),
         ).fetchall()
-    names = [r["canonical_name"] for r in rows]
+        return [r["canonical_name"] for r in rows]
+
+    names = _store.read(_fetch, what="get_top_entities", default=[]) or []
     with _top_entities_lock:
         _top_entities_cache[key] = (now + _TOP_ENTITIES_TTL_SEC, list(names))
     return names
 
 
 # ---------------------------------------------------------------------------
-# Stats (used by /sc:analyze etc.)
+# Stats (used by housekeeping scripts)
 # ---------------------------------------------------------------------------
 def stats(user_id: str | None = None) -> dict:
-    with _conn() as c:
+    def _fetch(c) -> dict:
         if user_id:
             ents = c.execute(
                 "SELECT count(*) FROM entities WHERE user_id=?", (user_id,)
@@ -454,10 +434,12 @@ def stats(user_id: str | None = None) -> dict:
             rels = c.execute("SELECT count(*) FROM entity_relations").fetchone()[0]
         edges = c.execute("SELECT count(*) FROM fact_entity_edges").fetchone()[0]
         aliases = c.execute("SELECT count(*) FROM entity_aliases").fetchone()[0]
-    return {
-        "entities": ents, "edges": edges, "aliases": aliases,
-        "relations": rels,
-    }
+        return {
+            "entities": ents, "edges": edges, "aliases": aliases,
+            "relations": rels,
+        }
+
+    return _store.read(_fetch, what="stats", default={}) or {}
 
 
 # ---------------------------------------------------------------------------
@@ -481,31 +463,38 @@ def add_relation(
     source_fact_id: str | None = None, valid_from: int | None = None,
 ) -> int:
     """Insert a typed temporal edge between two entities. Returns the row id
-    (0 on failure). The UNIQUE(..., COALESCE(valid_to, 0)) constraint lets
-    multiple historical versions coexist per (src, rel, dst) but allows
-    only one currently-valid row at a time.
+    (0 on failure). The partial unique index ``idx_relations_unique_open``
+    (``WHERE valid_to IS NULL``) lets historical versions coexist per
+    (src, rel, dst, user) while allowing only one currently-open row.
+
+    When an open row already exists, the INSERT is IGNOREd and the existing
+    row's id is returned — ``cur.lastrowid`` is meaningless after an ignored
+    insert, so we look the row up explicitly instead of trusting it.
     """
     if not src_id or not dst_id or not rel_type or not user_id:
         return 0
     now = int(time.time())
-    with _conn() as c, _db_lock:
-        try:
-            cur = c.execute(
-                "INSERT OR IGNORE INTO entity_relations("
-                "src_entity_id, rel_type, dst_entity_id, user_id, "
-                "created_at, valid_from, valid_to, source_fact_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
-                (int(src_id), rel_type, int(dst_id), str(user_id),
-                 now, valid_from, source_fact_id),
-            )
-            c.commit()
+
+    def _insert(c) -> int:
+        cur = c.execute(
+            "INSERT OR IGNORE INTO entity_relations("
+            "src_entity_id, rel_type, dst_entity_id, user_id, "
+            "created_at, valid_from, valid_to, source_fact_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
+            (int(src_id), rel_type, int(dst_id), str(user_id),
+             now, valid_from, source_fact_id),
+        )
+        if cur.rowcount:
             return int(cur.lastrowid or 0)
-        except Exception as exc:
-            log.warning(
-                "add_relation(%s,%s,%s) failed: %s",
-                src_id, rel_type, dst_id, exc,
-            )
-            return 0
+        row = c.execute(
+            "SELECT id FROM entity_relations "
+            "WHERE src_entity_id=? AND rel_type=? AND dst_entity_id=? "
+            "AND user_id=? AND valid_to IS NULL",
+            (int(src_id), rel_type, int(dst_id), str(user_id)),
+        ).fetchone()
+        return int(row["id"]) if row else 0
+
+    return _store.write(_insert, what="add_relation", default=0) or 0
 
 
 def expire_relation(relation_id: int, *, valid_to: int | None = None) -> bool:
@@ -515,18 +504,16 @@ def expire_relation(relation_id: int, *, valid_to: int | None = None) -> bool:
     if not relation_id:
         return False
     vt = int(valid_to or time.time())
-    with _conn() as c, _db_lock:
-        try:
-            cur = c.execute(
-                "UPDATE entity_relations SET valid_to=? "
-                "WHERE id=? AND (valid_to IS NULL OR valid_to=?)",
-                (vt, int(relation_id), vt),
-            )
-            c.commit()
-            return bool(cur.rowcount)
-        except Exception as exc:
-            log.warning("expire_relation(%s) failed: %s", relation_id, exc)
-            return False
+
+    def _expire(c) -> bool:
+        cur = c.execute(
+            "UPDATE entity_relations SET valid_to=? "
+            "WHERE id=? AND (valid_to IS NULL OR valid_to=?)",
+            (vt, int(relation_id), vt),
+        )
+        return bool(cur.rowcount)
+
+    return bool(_store.write(_expire, what="expire_relation", default=False))
 
 
 def get_relations(
@@ -572,6 +559,8 @@ def get_relations(
         + " ORDER BY created_at DESC LIMIT ?"
     )
     params.append(int(limit))
-    with _conn() as c:
-        rows = c.execute(sql, params).fetchall()
-    return [Relation(**dict(r)) for r in rows]
+
+    def _fetch(c) -> list[Relation]:
+        return [Relation(**dict(r)) for r in c.execute(sql, params).fetchall()]
+
+    return _store.read(_fetch, what="get_relations", default=[]) or []

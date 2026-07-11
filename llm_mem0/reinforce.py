@@ -19,20 +19,18 @@ single process and the existing batch ingest path is sequential per fact.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import os
+import math
 import time
+
+from .settings import settings
 
 log = logging.getLogger(__name__)
 
 # Public so callers / tests can introspect the schema.
 MAX_REINFORCED_HISTORY = 10
 MAX_IMPORTANCE = 5
-
-# Phase A-2 (mem0-recall-hybrid-hyde-kg): age decay defaults. Read once at
-# import so the boost calculation stays a hot-path no-cost lookup.
-_DEFAULT_ALPHA_AGE = float(os.environ.get("MEM0_BOOST_ALPHA_AGE", "0.03"))
-_DEFAULT_AGE_HALF_LIFE_DAYS = float(os.environ.get("MEM0_BOOST_AGE_HALF_LIFE_DAYS", "90"))
 
 
 def reinforce_existing_sync(mem, memory_id: str) -> bool:
@@ -95,7 +93,6 @@ def reinforce_existing_sync(mem, memory_id: str) -> bool:
 async def reinforce_existing(mem, memory_id: str) -> bool:
     """Async wrapper around the sync helper, for ingest call sites that
     already live in an event loop."""
-    import asyncio
     return await asyncio.to_thread(reinforce_existing_sync, mem, memory_id)
 
 
@@ -120,8 +117,6 @@ def reinforcement_boost(metadata: dict | None, *,
     boost from the candidate's cosine distance, effectively bringing
     reinforced/recent facts closer in score-space.
     """
-    import math
-
     if not metadata:
         return 0.0
     try:
@@ -143,8 +138,9 @@ def reinforcement_boost(metadata: dict | None, *,
     # scripts/backfill_mem0_timestamps.py also carry it. We accept
     # created_at_unix as an alias for any future caller that writes it
     # under that name.
-    aa = _DEFAULT_ALPHA_AGE if alpha_age is None else alpha_age
-    ah = _DEFAULT_AGE_HALF_LIFE_DAYS if age_half_life_days is None else age_half_life_days
+    aa = settings.MEM0_BOOST_ALPHA_AGE if alpha_age is None else alpha_age
+    ah = (settings.MEM0_BOOST_AGE_HALF_LIFE_DAYS
+          if age_half_life_days is None else age_half_life_days)
     if aa and ah > 0:
         try:
             created = int(metadata.get("created_at_unix") or metadata.get("timestamp") or 0)

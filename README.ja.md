@@ -69,6 +69,39 @@ pip install "llm-mem0[openai]"
 pip install "llm-mem0[japanese]"
 ```
 
+## MCP サーバー
+
+Mem0α を [Model Context Protocol](https://modelcontextprotocol.io) サーバーとして公開し、MCP クライアント（Claude Code、Claude Desktop、Cursor など）から長期記憶をツールとして使えます。
+
+```bash
+pip install "mem0-alpha[mcp]"
+mem0-alpha-mcp        # stdio トランスポート
+```
+
+クライアント設定例（Claude Code の `.mcp.json` / Claude Desktop）:
+
+```json
+{
+  "mcpServers": {
+    "mem0-alpha": {
+      "command": "mem0-alpha-mcp",
+      "env": { "MEM0_DEFAULT_USER_ID": "you" }
+    }
+  }
+}
+```
+
+公開ツール:
+
+| ツール | 何をするか |
+|---|---|
+| `add_memory(user_text, …)` | 会話ターンを抽出ゲート経由で保存。ストア停止やパイプライン失敗はツール結果にエラーとして返る（偽の成功を返さない） |
+| `search_memory(query, limit, smart)` | プロンプトにそのまま差し込める、インジェクション対策済みの記憶ブロック。`smart=true` でクエリ書き換え + LLM rerank |
+| `list_memories(limit)` | 記憶を ID・importance/tier・本文つきで一覧（棚卸し用） |
+| `delete_memory(memory_id)` | 記憶を1件削除し、副インデックス（エンティティグラフ・BM25）からも掃除する |
+
+`MEM0_DEFAULT_USER_ID` をサーバー env に設定すると全ツールで `user_id` 引数を省略できます（シングルユーザー構成での推奨）。その他の設定はライブラリと同じ環境変数を継承します（下の「設定」参照）。
+
 ## 動かす前に
 
 - **ベクトルストア。** 既定では ChromaDB の HTTP サーバーにつなぎます。
@@ -105,6 +138,7 @@ pip install "llm-mem0[japanese]"
 | `MEM0_LLM_MODEL` | バックエンド既定 | 抽出・重複排除・並べ替えに使うモデル |
 | `MEM0_EMBEDDER_PROVIDER` / `MEM0_EMBEDDER_MODEL` | `openai` / `text-embedding-3-small` | 埋め込みモデル |
 | `LLM_MEM0_STATE_DIR` | `~/.llm_mem0/state` | sqlite インデックスと embedded Chroma の置き場所 |
+| `MEM0_DEFAULT_USER_ID` | （未設定） | MCP ツールの既定 `user_id` |
 | `MEM0_HYBRID_ENABLED` | `true` | BM25 とベクトル検索を束ねる |
 | `MEM0_HYDE_ENABLED` | `true` | HyDE（仮の解答文）でクエリを広げる |
 

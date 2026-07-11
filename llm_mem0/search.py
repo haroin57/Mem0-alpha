@@ -1,24 +1,22 @@
 """Semantic search: plain/multi/smart + LLM-based query rewrite & re-rank."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
-import os
 import re
 import time
 
-from .format import strip_json_fence
-
-from .client import (
-    MEM0_RELEVANCE_MAX_DISTANCE,
-    _get_mem0,
-)
+from .client import _get_mem0, mem_get_all, mem_search
+from .llm import complete_json, escape_braces
+from .settings import settings
 
 log = logging.getLogger(__name__)
 
 
-# Caller-side gate for the Haiku rewrite/rerank stages. The default
-# conversation turn skips these to save ~4 LLM round-trips; turns that
-# explicitly ask for recall ("覚えてる" / "前に話した" / "remember") opt in.
+# Caller-side gate for the rewrite/rerank stages. The default conversation
+# turn skips these to save ~4 LLM round-trips; turns that explicitly ask for
+# recall ("覚えてる" / "前に話した" / "remember") opt in.
 _MEMORY_LLM_INTENT_RE = re.compile(
     r"(前に話した|前に言った|以前話した|覚えてる|覚えている|覚えてます|"
     r"記憶|思い出|思い出して|remember|recall|do you remember|what do you remember)",
@@ -50,11 +48,7 @@ def _is_fact_valid(
     """
     md = r.get("metadata") or {}
     # Phase C/R: scope フィルタ（conversation 限定 fact の誤注入防止）
-    try:
-        from .settings import MEM0_SCOPE_FILTER_ENABLED
-    except Exception:
-        MEM0_SCOPE_FILTER_ENABLED = False
-    if MEM0_SCOPE_FILTER_ENABLED and check_scope:
+    if settings.MEM0_SCOPE_FILTER_ENABLED and check_scope:
         scope = md.get("scope") or "global"
         if scope.startswith("conversation"):
             want = (
@@ -64,11 +58,7 @@ def _is_fact_valid(
             if scope != want:
                 return False
     # Phase B-2: valid_to soft-archive
-    try:
-        from .settings import MEM0_HIDE_ARCHIVED
-    except Exception:
-        MEM0_HIDE_ARCHIVED = True
-    if not MEM0_HIDE_ARCHIVED:
+    if not settings.MEM0_HIDE_ARCHIVED:
         return True
     vt = md.get("valid_to")
     if not vt:
@@ -101,43 +91,37 @@ async def search_memories(
         return []
     try:
         t0 = time.perf_counter()
-        raw = await asyncio.to_thread(mem.search, query=query, user_id=user_id, limit=limit)
+        raw = await asyncio.to_thread(
+            mem_search, mem, query=query, user_id=user_id, limit=limit)
         latency_ms = (time.perf_counter() - t0) * 1000.0
         results = raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
         log.info(
             "mem0_search_latency_ms=%.1f query=%r user_id=%s limit=%d hits=%d",
             latency_ms, (query or "")[:80], user_id, limit, len(results),
         )
-        filtered = [
+        max_distance = settings.MEM0_RELEVANCE_MAX_DISTANCE
+        return [
             r for r in results
             if (
                 not apply_distance_filter
                 or r.get("score") is None
-                or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE
+                or r.get("score", 0) <= max_distance
             )
             and _is_fact_valid(r, current_channel_id)
         ]
-        return filtered
     except Exception as exc:
         log.warning("Mem0 search error: %s", exc)
         return []
 
 
-async def search_memories_multi(
-    queries: list[str], user_id: str, limit: int = 8,
-    *, current_channel_id: str | None = None,
-) -> list[dict]:
-    """Search with multiple queries and merge deduplicated results."""
-    if not queries:
-        return []
-    tasks = [
-        search_memories(
-            q, user_id, limit=limit, current_channel_id=current_channel_id,
-        )
-        for q in queries
-    ]
-    all_results = await asyncio.gather(*tasks, return_exceptions=True)
+def _merge_ranked_results(all_results: list, limit: int) -> list[dict]:
+    """Merge per-query result lists: dedup by id, sort ascending by score.
 
+    ``score`` is *distance* — ascending = most-relevant first. Missing
+    scores sink to the bottom by treating them as worst-case (large
+    distance). Exceptions from ``asyncio.gather(..., return_exceptions=True)``
+    are skipped. Shared by the plain and hybrid multi-query paths.
+    """
     seen_ids: set[str] = set()
     merged: list[dict] = []
     for result_set in all_results:
@@ -148,11 +132,27 @@ async def search_memories_multi(
             if mid not in seen_ids:
                 seen_ids.add(mid)
                 merged.append(r)
-
-    # score is *distance* — ascending = most-relevant first. Missing scores
-    # sink to the bottom by treating them as worst-case (large distance).
     merged.sort(key=lambda x: x.get("score") if x.get("score") is not None else 99)
     return merged[:limit]
+
+
+async def search_memories_multi(
+    queries: list[str], user_id: str, limit: int = 8,
+    *, current_channel_id: str | None = None,
+) -> list[dict]:
+    """Search with multiple queries and merge deduplicated results."""
+    if not queries:
+        return []
+    all_results = await asyncio.gather(
+        *(
+            search_memories(
+                q, user_id, limit=limit, current_channel_id=current_channel_id,
+            )
+            for q in queries
+        ),
+        return_exceptions=True,
+    )
+    return _merge_ranked_results(all_results, limit)
 
 
 # ---------------------------------------------------------------------------
@@ -173,11 +173,7 @@ async def search_memories_hybrid(
     ``search_memories`` for that one query. This is the per-query flag we
     want; the smart-search multi-query merge sits a layer above.
     """
-    try:
-        from .settings import MEM0_HYBRID_ENABLED, MEM0_BM25_RRF_K, MEM0_BM25_LIMIT
-    except Exception:
-        MEM0_HYBRID_ENABLED, MEM0_BM25_RRF_K, MEM0_BM25_LIMIT = True, 60, 20
-    if not MEM0_HYBRID_ENABLED:
+    if not settings.MEM0_HYBRID_ENABLED:
         return await search_memories(
             query, user_id, limit=limit,
             apply_distance_filter=apply_distance_filter,
@@ -191,7 +187,7 @@ async def search_memories_hybrid(
         current_channel_id=current_channel_id,
     )
     bm25_task = asyncio.to_thread(
-        bm25_index.search_bm25, query, user_id, MEM0_BM25_LIMIT,
+        bm25_index.search_bm25, query, user_id, settings.MEM0_BM25_LIMIT,
     )
     vector_hits, bm25_hits = await asyncio.gather(
         vector_task, bm25_task, return_exceptions=True,
@@ -203,7 +199,7 @@ async def search_memories_hybrid(
         log.warning("hybrid: bm25 search failed: %s", bm25_hits)
         bm25_hits = []
     fused = bm25_index.rrf_merge(
-        vector_hits, bm25_hits, k=MEM0_BM25_RRF_K, limit=limit,
+        vector_hits, bm25_hits, k=settings.MEM0_BM25_RRF_K, limit=limit,
     )
     if bm25_hits:
         log.info(
@@ -220,35 +216,25 @@ async def _search_multi_hybrid(
 ) -> list[dict]:
     """Multi-query merge that uses ``search_memories_hybrid`` per query.
 
-    Mirrors ``search_memories_multi`` structure 1:1 so callers downstream
-    don't notice the swap. We keep the merge dedup-by-id + score-ascending
-    sort here too because RRF-only ordering would defeat the LLM rerank's
-    reinforcement-boost math (which subtracts from distance).
+    Mirrors ``search_memories_multi`` so callers downstream don't notice the
+    swap. The merge stays dedup-by-id + score-ascending (not RRF-only
+    ordering) because the LLM rerank's reinforcement-boost math subtracts
+    from distance.
     """
     if not queries:
         return []
-    tasks = [
-        search_memories_hybrid(
-            q, user_id, limit=limit,
-            apply_distance_filter=apply_distance_filter,
-            current_channel_id=current_channel_id,
-        )
-        for q in queries
-    ]
-    all_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    seen_ids: set[str] = set()
-    merged: list[dict] = []
-    for result_set in all_results:
-        if isinstance(result_set, Exception):
-            continue
-        for r in result_set:
-            mid = r.get("id", r.get("memory", ""))
-            if mid not in seen_ids:
-                seen_ids.add(mid)
-                merged.append(r)
-    merged.sort(key=lambda x: x.get("score") if x.get("score") is not None else 99)
-    return merged[:limit]
+    all_results = await asyncio.gather(
+        *(
+            search_memories_hybrid(
+                q, user_id, limit=limit,
+                apply_distance_filter=apply_distance_filter,
+                current_channel_id=current_channel_id,
+            )
+            for q in queries
+        ),
+        return_exceptions=True,
+    )
+    return _merge_ranked_results(all_results, limit)
 
 
 # ---------------------------------------------------------------------------
@@ -300,13 +286,13 @@ _HYDE_PROMPT = """ユーザーの質問に対して、Mem0 (長期記憶) に保
 {{"hypothetical":"<生成された事実文>"}}"""
 
 
-# Phase A-1 follow-up: Haiku-based content-word extraction.
-# Janome default-dictionary splits "森川あかり" / "上原みなと" into noisy
-# fragments because new proper nouns aren't in the bundled lexicon. Haiku
-# sees the full surrounding context and keeps multi-character compounds
-# intact — at the cost of one extra LLM round-trip per smart search.
-# Used in parallel with Janome via _expand_query_via_morpho; results are
-# unioned into the smart_search query list.
+# Phase A-1 follow-up: LLM-based content-word extraction.
+# Janome default-dictionary splits new proper nouns into noisy fragments
+# because they aren't in the bundled lexicon. The helper model sees the full
+# surrounding context and keeps multi-character compounds intact — at the
+# cost of one extra LLM round-trip per smart search. Used in parallel with
+# Janome via _expand_query_via_morpho; results are unioned into the
+# smart-search query list.
 _KEYWORD_EXTRACT_PROMPT = """ユーザーの質問から、Mem0 検索に使う「内容語キーワード」を抽出してください。
 
 ユーザー質問: {query}
@@ -322,41 +308,34 @@ _KEYWORD_EXTRACT_PROMPT = """ユーザーの質問から、Mem0 検索に使う�
 
 
 async def _extract_keywords_via_llm(query: str) -> str:
-    """Haiku-based content-word extraction. Returns whitespace-joined
+    """LLM-based content-word extraction. Returns whitespace-joined
     keywords (+ aliases) or empty string on any failure."""
     q = (query or "").strip()
     if len(q) < 8:
         return ""
-    try:
-        from .auth import get_auth_backend
-        backend = get_auth_backend()
-        safe_query = q[:500].replace("{", "{{").replace("}", "}}")
-        text = strip_json_fence(await backend.complete(
-            system=(
-                "You extract content-word keywords from a user search "
-                "query. Return JSON only."
-            ),
-            user_message=_KEYWORD_EXTRACT_PROMPT.format(query=safe_query),
-            model=os.environ.get("MEM0_KEYWORD_MODEL", "claude-haiku-4-5-20251001"),
-            max_tokens=int(os.environ.get("MEM0_KEYWORD_MAX_TOKENS", "300")),
-        ))
-        if not text:
-            return ""
-        import json as _json
-        data = _json.loads(text)
-        kws = [str(k).strip() for k in data.get("keywords", []) if str(k).strip()]
-        aliases = [str(a).strip() for a in data.get("aliases", []) if str(a).strip()]
-        # Stable de-dupe, source order, keyword + alias union
-        seen: set[str] = set()
-        out: list[str] = []
-        for k in kws + aliases:
-            if k not in seen:
-                seen.add(k)
-                out.append(k)
-        return " ".join(out[:10])
-    except Exception as exc:
-        log.warning("keyword_extract_via_llm failed (non-fatal): %s", exc)
+    data = await complete_json(
+        system=(
+            "You extract content-word keywords from a user search "
+            "query. Return JSON only."
+        ),
+        user_message=_KEYWORD_EXTRACT_PROMPT.format(
+            query=escape_braces(q, limit=500)),
+        model=settings.MEM0_KEYWORD_MODEL,
+        max_tokens=settings.MEM0_KEYWORD_MAX_TOKENS,
+        caller="search.keyword_extract",
+    )
+    if not isinstance(data, dict):
         return ""
+    kws = [str(k).strip() for k in data.get("keywords", []) if str(k).strip()]
+    aliases = [str(a).strip() for a in data.get("aliases", []) if str(a).strip()]
+    # Stable de-dupe, source order, keyword + alias union
+    seen: set[str] = set()
+    out: list[str] = []
+    for k in kws + aliases:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return " ".join(out[:10])
 
 
 async def _generate_hypothetical_fact(query: str) -> str:
@@ -371,67 +350,39 @@ async def _generate_hypothetical_fact(query: str) -> str:
     pipeline tolerates empty variants without retry cost.
     """
     q = (query or "").strip()
-    if len(q) < 8:
+    if len(q) < 8 or not settings.MEM0_HYDE_ENABLED:
         return ""
-    try:
-        from .settings import MEM0_HYDE_ENABLED
-        if not MEM0_HYDE_ENABLED:
-            return ""
-    except Exception:
-        pass
-    try:
-        from .auth import get_auth_backend
-        backend = get_auth_backend()
-        safe_query = q[:500].replace("{", "{{").replace("}", "}}")
-        text = strip_json_fence(await backend.complete(
-            system=(
-                "You generate a single hypothetical fact statement that "
-                "would answer the user's question. Return JSON only."
-            ),
-            user_message=_HYDE_PROMPT.format(query=safe_query),
-            model=os.environ.get("MEM0_HYDE_MODEL", "claude-haiku-4-5-20251001"),
-            max_tokens=int(os.environ.get("MEM0_HYDE_MAX_TOKENS", "200")),
-        ))
-        if not text:
-            return ""
-        import json as _json
-        out = _json.loads(text).get("hypothetical", "")
-        if isinstance(out, str):
-            return out.strip()
-        return ""
-    except Exception as exc:
-        log.warning("hyde failed (non-fatal): %s", exc)
-        return ""
+    data = await complete_json(
+        system=(
+            "You generate a single hypothetical fact statement that "
+            "would answer the user's question. Return JSON only."
+        ),
+        user_message=_HYDE_PROMPT.format(query=escape_braces(q, limit=500)),
+        model=settings.MEM0_HYDE_MODEL,
+        max_tokens=settings.MEM0_HYDE_MAX_TOKENS,
+        caller="search.hyde",
+    )
+    out = (data or {}).get("hypothetical", "") if isinstance(data, dict) else ""
+    return out.strip() if isinstance(out, str) else ""
 
 
 async def _rewrite_query(query: str) -> list[str]:
-    """Expand a user query into canonical-keyword variants via Haiku."""
-    try:
-        from .auth import get_auth_backend
-        backend = get_auth_backend()
-        # M2: length-cap and escape braces to prevent format-string injection
-        safe_query = query[:500].replace("{", "{{").replace("}", "}}")
-        # Output is a tiny JSON {"queries": [up to 5 short strings]}.
-        # 500 tokens easily covers it; 2000 overspec inflates billed output
-        # reservation. Override via MEM0_REWRITE_MAX_TOKENS if needed.
-        text = strip_json_fence(await backend.complete(
-            system=(
-                "You rewrite a user search query into canonical Mem0 keywords. "
-                "Return JSON only."
-            ),
-            user_message=_REWRITE_PROMPT.format(query=safe_query),
-            model=os.environ.get("MEM0_REWRITE_MODEL", "claude-haiku-4-5-20251001"),
-            max_tokens=int(os.environ.get("MEM0_REWRITE_MAX_TOKENS", "500")),
-        ))
-        if not text:
-            return []
-        import json as _json
-        data = _json.loads(text)
-        out = data.get("queries", [])
-        return [q for q in out if isinstance(q, str) and q.strip()][:5]
-    except Exception as exc:
-        log.warning("rewrite_query failed: %s", exc)
+    """Expand a user query into canonical-keyword variants."""
+    data = await complete_json(
+        system=(
+            "You rewrite a user search query into canonical Mem0 keywords. "
+            "Return JSON only."
+        ),
+        user_message=_REWRITE_PROMPT.format(
+            query=escape_braces(query, limit=500)),
+        model=settings.MEM0_REWRITE_MODEL,
+        max_tokens=settings.MEM0_REWRITE_MAX_TOKENS,
+        caller="search.rewrite_query",
+    )
+    if not isinstance(data, dict):
         return []
+    out = data.get("queries", [])
+    return [q for q in out if isinstance(q, str) and q.strip()][:5]
 
 
 def _apply_reinforcement_boost(memories: list[dict]) -> None:
@@ -476,58 +427,45 @@ async def _rerank_memories(query: str, memories: list[dict], top_k: int = 5) -> 
 
     if len(memories) <= top_k:
         return memories
-    try:
-        from .auth import get_auth_backend
-        backend = get_auth_backend()
-        # M2: length-cap query, escape braces in query and candidate text
-        safe_query = query[:500].replace("{", "{{").replace("}", "}}")
-        candidates_lines = []
-        for i, m in enumerate(memories):
-            mem_text = m.get("memory", "")[:120]
-            # wrap each candidate in untrusted delimiters and escape braces
-            safe_mem = mem_text.replace("{", "{{").replace("}", "}}")
-            candidates_lines.append(
-                f"{i+1}: <untrusted_candidate>{safe_mem}</untrusted_candidate>"
-            )
-        candidates = "\n".join(candidates_lines)
-        # Output is {"top": [<= top_k integers]}. 400 tokens covers the
-        # JSON plus any short reasoning the model emits. Override via
-        # MEM0_RERANK_MAX_TOKENS if needed.
-        text = strip_json_fence(await backend.complete(
-            system=(
-                "You rerank Mem0 candidate memories by relevance to the "
-                "original query. Return JSON only."
-            ),
-            user_message=_RERANK_PROMPT.format(
-                query=safe_query, top_k=top_k, candidates=candidates,
-            ),
-            model=os.environ.get("MEM0_RERANK_MODEL", "claude-haiku-4-5-20251001"),
-            max_tokens=int(os.environ.get("MEM0_RERANK_MAX_TOKENS", "400")),
-        ))
-        if not text:
-            return memories[:top_k]
-        import json as _json
-        idxs = _json.loads(text).get("top", [])
-        picked = []
-        for idx in idxs:
-            try:
-                k = int(idx) - 1
-                if 0 <= k < len(memories):
-                    picked.append(memories[k])
-            except (TypeError, ValueError):
-                continue
-        # fallback fill with score-order if reranker returned fewer
-        if len(picked) < top_k:
-            seen_ids = {id(p) for p in picked}
-            for m in memories:
-                if id(m) not in seen_ids:
-                    picked.append(m)
-                    if len(picked) >= top_k:
-                        break
-        return picked[:top_k]
-    except Exception as exc:
-        log.warning("rerank_memories failed: %s", exc)
+    candidates = "\n".join(
+        # wrap each candidate in untrusted delimiters and escape braces
+        f"{i + 1}: <untrusted_candidate>"
+        f"{escape_braces(m.get('memory', ''), limit=120)}"
+        f"</untrusted_candidate>"
+        for i, m in enumerate(memories)
+    )
+    data = await complete_json(
+        system=(
+            "You rerank Mem0 candidate memories by relevance to the "
+            "original query. Return JSON only."
+        ),
+        user_message=_RERANK_PROMPT.format(
+            query=escape_braces(query, limit=500),
+            top_k=top_k, candidates=candidates,
+        ),
+        model=settings.MEM0_RERANK_MODEL,
+        max_tokens=settings.MEM0_RERANK_MAX_TOKENS,
+        caller="search.rerank",
+    )
+    if not isinstance(data, dict):
         return memories[:top_k]
+    picked = []
+    for idx in data.get("top", []):
+        try:
+            k = int(idx) - 1
+            if 0 <= k < len(memories):
+                picked.append(memories[k])
+        except (TypeError, ValueError):
+            continue
+    # fallback fill with score-order if reranker returned fewer
+    if len(picked) < top_k:
+        seen_ids = {id(p) for p in picked}
+        for m in memories:
+            if id(m) not in seen_ids:
+                picked.append(m)
+                if len(picked) >= top_k:
+                    break
+    return picked[:top_k]
 
 
 async def get_episode_facts(
@@ -554,6 +492,7 @@ async def get_episode_facts(
     mem = await asyncio.to_thread(_get_mem0)
     if mem is None:
         return []
+    from .client import _rejects_user_id_kwarg
     try:
         raw = await asyncio.to_thread(
             mem.get_all,
@@ -561,18 +500,19 @@ async def get_episode_facts(
             filters={"episode_id": episode_id},
             limit=limit,
         )
-    except TypeError:
-        # SDK doesn't accept `filters` — fall back to a full pull + filter.
+    except Exception as exc:
+        if not (isinstance(exc, TypeError) or _rejects_user_id_kwarg(exc)):
+            log.warning("get_episode_facts get_all failed: %s", exc)
+            return []
+        # SDK doesn't accept this call shape (no `filters` on old SDKs, no
+        # top-level user_id on new ones) — user-scoped pull + Python filter.
         try:
             raw = await asyncio.to_thread(
-                mem.get_all, user_id=user_id, limit=max(limit * 10, 200),
+                mem_get_all, mem, user_id=user_id, limit=max(limit * 10, 200),
             )
-        except Exception as exc:
-            log.warning("get_episode_facts fallback get_all failed: %s", exc)
+        except Exception as exc2:
+            log.warning("get_episode_facts fallback get_all failed: %s", exc2)
             return []
-    except Exception as exc:
-        log.warning("get_episode_facts get_all failed: %s", exc)
-        return []
     rows = raw.get("results", []) if isinstance(raw, dict) else (raw or [])
     filtered = [
         r for r in rows
@@ -655,15 +595,11 @@ async def get_core_memories(
     キャッシュは user 単位で channel 横断共有なので、内側で scope を落とすと
     会話間でキャッシュ汚染する（キャッシュ計算は check_scope=False）。
     """
-    try:
-        from .settings import MEM0_CORE_MEMORY_ENABLED, MEM0_CORE_CACHE_TTL_S
-    except Exception:
-        MEM0_CORE_MEMORY_ENABLED, MEM0_CORE_CACHE_TTL_S = True, 300
-    if not MEM0_CORE_MEMORY_ENABLED or max_items <= 0:
+    if not settings.MEM0_CORE_MEMORY_ENABLED or max_items <= 0:
         return []
     now = time.monotonic()
     hit = _CORE_CACHE.get(user_id)
-    if hit is not None and now - hit[0] < MEM0_CORE_CACHE_TTL_S:
+    if hit is not None and now - hit[0] < settings.MEM0_CORE_CACHE_TTL_S:
         return [
             dict(m) for m in hit[1]
             if _is_fact_valid(m, current_channel_id)
@@ -729,13 +665,13 @@ async def _expand_queries(query: str, user_id: str, *, rewrite: bool) -> list[st
 
     Layers, cheapest first: entity-graph alias expansion (sqlite lookup),
     morphological content-word variant (Janome, no LLM), then — only when
-    ``rewrite`` — the Haiku trio (canonical-keyword rewrite, HyDE fact
+    ``rewrite`` — the helper-model trio (canonical-keyword rewrite, HyDE fact
     paraphrase, LLM keyword extraction) run in parallel. Downstream merge
     dedupes, so redundancy between layers is harmless.
     """
     queries = [query]
     # Graph-based alias expansion runs even when LLM rewrite is disabled
-    # — it's a cheap sqlite lookup, no extra Anthropic round-trip.
+    # — it's a cheap sqlite lookup, no extra LLM round-trip.
     alias_variants = await _expand_query_via_graph(query, user_id)
     if alias_variants:
         log.info(
@@ -774,18 +710,14 @@ async def _expand_queries(query: str, user_id: str, *, rewrite: bool) -> list[st
 
 
 async def _expand_episode_bundle(
-    reranked: list[dict], user_id: str, current_channel_id: "str | None",
+    reranked: list[dict], user_id: str, current_channel_id: str | None,
 ) -> int:
     """Phase C-3: append sibling facts from the top-1 hit's episode.
 
     Mutates ``reranked`` in place and returns how many facts were appended.
     Non-fatal on every failure path (fail-open, returns 0).
     """
-    try:
-        from .settings import MEM0_EPISODE_BUNDLE_ENABLED, MEM0_EPISODE_BUNDLE_LIMIT
-    except Exception:
-        MEM0_EPISODE_BUNDLE_ENABLED, MEM0_EPISODE_BUNDLE_LIMIT = True, 5
-    if not (MEM0_EPISODE_BUNDLE_ENABLED and reranked):
+    if not (settings.MEM0_EPISODE_BUNDLE_ENABLED and reranked):
         return 0
     try:
         top_md = reranked[0].get("metadata") or {}
@@ -810,7 +742,7 @@ async def _expand_episode_bundle(
             e["_episode_bundle"] = True
             if e.get("score") is None:
                 e["score"] = 0.85
-        keep = extras[: max(int(MEM0_EPISODE_BUNDLE_LIMIT), 0)]
+        keep = extras[: max(int(settings.MEM0_EPISODE_BUNDLE_LIMIT), 0)]
         reranked.extend(keep)
         log.info("episode_bundle: +%d facts from %s", len(keep), top_episode)
         return len(keep)
@@ -825,16 +757,11 @@ def _log_smart_metrics(
     """Phase B-3: one-line metric so a week of journalctl reduces to
     hit-rate stats with grep. Keys are positional for a simple regex."""
     if rerank:
-        try:
-            from .settings import MEM0_HYBRID_ENABLED as _hyb
-            from .settings import MEM0_HYDE_ENABLED as _hyde
-        except Exception:
-            _hyb = _hyde = False
         log.info(
             "[MEM0_METRICS query_len=%d candidates=%d kept=%d bundle=%d "
             "hybrid=%s hyde=%s rerank=on]",
             len(query or ""), len(candidates), kept, bundle_added,
-            bool(_hyb), bool(_hyde),
+            bool(settings.MEM0_HYBRID_ENABLED), bool(settings.MEM0_HYDE_ENABLED),
         )
     else:
         log.info(
@@ -853,7 +780,7 @@ async def search_memories_smart(
     """Query-rewriting + re-ranking enhanced search.
 
     Orchestration only — each phase lives in its own helper (P5-a):
-      1. _expand_queries: graph alias + morpho + Haiku trio variants.
+      1. _expand_queries: graph alias + morpho + helper-model trio variants.
       2. _search_multi_hybrid over the expanded query set.
       3. _graph_expand_candidates: 1-hop entity sibling rescue.
       4. rerank path: _rerank_memories + _expand_episode_bundle;
@@ -918,11 +845,11 @@ async def search_memories_smart(
     # the candidates[:limit] cut below — previously this only ran on the
     # rerank=True (recall-intent) path, so normal turns had no per-user bias.
     _apply_reinforcement_boost(candidates)
-    from .client import MEM0_RELEVANCE_MAX_DISTANCE
+    max_distance = settings.MEM0_RELEVANCE_MAX_DISTANCE
     filtered = [
         r for r in candidates[:limit]
         if r.get("score") is None
-        or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE
+        or r.get("score", 0) <= max_distance
     ]
     _log_smart_metrics(query, candidates, len(filtered), 0, rerank=False)
     if core_task is not None:
@@ -944,9 +871,7 @@ async def _graph_expand_candidates(
     """
     if not candidates:
         return candidates
-    import asyncio as _asyncio
     from . import graph
-    from .client import _get_mem0
     # 初回 init の ChromaDB heartbeat (同期 requests) でループを止めない。
     mem = await asyncio.to_thread(_get_mem0)
     if mem is None:
@@ -959,12 +884,12 @@ async def _graph_expand_candidates(
         if not fid:
             continue
         try:
-            entities = await _asyncio.to_thread(graph.get_fact_entities, fid)
+            entities = await asyncio.to_thread(graph.get_fact_entities, fid)
         except Exception:
             continue
         for e in entities:
             try:
-                related = await _asyncio.to_thread(
+                related = await asyncio.to_thread(
                     graph.get_related_facts, e.id, limit=per_entity,
                     exclude_fact_ids=list(seen_ids),
                 )
@@ -982,7 +907,7 @@ async def _graph_expand_candidates(
     siblings: list[dict] = []
     for fid in sibling_ids:
         try:
-            fact = await _asyncio.to_thread(mem.get, fid)
+            fact = await asyncio.to_thread(mem.get, fid)
             # Phase R: graph 経由の sibling は search_memories の validity
             # フィルタを通らないので、archived / 他会話 scope をここで落とす。
             if (
