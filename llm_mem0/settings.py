@@ -134,6 +134,14 @@ _SPECS: dict[str, _Spec] = {
     "MEM0_PRIMING_ACTIVATION_BONUS": _Spec(0.1, float),
     "MEM0_PRIMING_TTL_SEC": _Spec(30 * 60, int),
     "MEM0_PRIMING_MAX_ENTITIES": _Spec(20, int),
+    # Phase ⑦: feeling-of-knowing gate. When enabled and the whole candidate
+    # pool's best RAW cosine distance exceeds NO_MEMORY, smart search skips
+    # the rerank LLM call and returns a calibrated null-result sentinel
+    # instead (rendered by format_memories_for_prompt). Thresholds are on
+    # raw distance, same units as MEM0_RELEVANCE_MAX_DISTANCE.
+    "MEM0_FOK_ENABLED": _Spec(False, _parse_bool),
+    "MEM0_FOK_NO_MEMORY_DISTANCE": _Spec(1.1, float),
+    "MEM0_FOK_WEAK_DISTANCE": _Spec(0.75, float),
     # History embedding: semantic recall over the raw transcript, in a
     # separate Chroma collection. Off by default — each line costs one
     # embedding call.

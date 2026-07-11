@@ -100,8 +100,23 @@ def _fact_meta_suffix(m: dict) -> str:
 
 
 def format_memories_for_prompt(memories: list[dict]) -> str:
-    """Format retrieved memories as a prompt-injection block."""
+    """Format retrieved memories as a prompt-injection block.
+
+    Phase ⑦: a ``_fok_no_memory`` sentinel (see
+    ``search.assess_recall_confidence`` / ``MEM0_FOK_ENABLED``) renders as an
+    explicit "nothing relevant found" line rather than being silently
+    dropped — a calibrated null result reads very differently to the model
+    than the fact block simply not being there, and the latter invites
+    confabulation ("memory wasn't consulted" vs. "memory was consulted and
+    came up empty"). Core memories (unconditional, query-independent) still
+    render normally alongside it when present.
+    """
     if not memories:
+        return ""
+
+    fok_entry = next((m for m in memories if m.get("_fok_no_memory")), None)
+    real = [m for m in memories if not m.get("_fok_no_memory")]
+    if not real and not fok_entry:
         return ""
 
     lines = [
@@ -111,12 +126,17 @@ def format_memories_for_prompt(memories: list[dict]) -> str:
     ]
     # core memory（常時注入枠）を先頭に固定し、クエリ依存の recall と区別する。
     ordered = sorted(
-        memories, key=lambda m: 0 if m.get("_core") else 1,
+        real, key=lambda m: 0 if m.get("_core") else 1,
     )
     for m in ordered:
         text = m.get("memory", m.get("text", ""))
         if text:
             lines.append(f"- {_scrub_fact_text(text)}{_fact_meta_suffix(m)}")
+    if fok_entry:
+        lines.append(
+            "(このクエリに一致する具体的な記憶は見つからなかった。"
+            "推測で補完しないこと)"
+        )
     lines.append("[End of Long-term memory]")
     return "\n".join(lines)
 
